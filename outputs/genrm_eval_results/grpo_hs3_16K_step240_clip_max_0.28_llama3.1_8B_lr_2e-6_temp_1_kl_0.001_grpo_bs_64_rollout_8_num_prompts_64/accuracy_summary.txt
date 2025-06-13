@@ -1,0 +1,7 @@
+step_20: Accuracy = 56.86%
+step_40: Accuracy = 31.43%
+step_50: Accuracy = 49.14%
+step_60: Accuracy = 44.29%
+step_70: Accuracy = 38.57%
+step_80: Accuracy = 9.14%
+step_90: Accuracy = 1.14%
