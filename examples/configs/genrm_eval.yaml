@@ -1,0 +1,38 @@
+# GenRM Evaluation Configuration
+eval:
+  dataset_name: "judgebench"  # Options: judgebench, rmbench, rewardbench
+  batch_size: 8
+  seed: 42
+  output_file: "results/genrm_eval.json"
+
+generation:
+  backend: "vllm"
+  max_new_tokens: 2048
+  temperature: 0.0  # Deterministic for evaluation
+  top_p: 1.0
+  top_k: -1
+  num_prompts_per_step: -1
+  model_name: "results/grpo_genrm/HF/step_100"  # Update with your checkpoint path results/grpo_genrm/HF/step_65
+  stop_token_ids: null
+  stop_strings: null
+  vllm_cfg:
+    async_engine: false
+    precision: "bfloat16"
+    tensor_parallel_size: 1
+    pipeline_parallel_size: 1
+    gpu_memory_utilization: 0.9
+    max_model_len: 4096
+
+
+tokenizer:
+  name: ${generation.model_name}
+  chat_template: "default"
+
+
+    
+data:
+  max_input_seq_length: 4096
+
+cluster:
+  gpus_per_node: 2
+  num_nodes: 1

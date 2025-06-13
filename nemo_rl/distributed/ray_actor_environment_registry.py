@@ -22,6 +22,7 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     "nemo_rl.models.policy.fsdp1_policy_worker.FSDP1PolicyWorker": PY_EXECUTABLES.BASE,
     "nemo_rl.environments.math_environment.MathEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.games.sliding_puzzle.SlidingPuzzleEnv": PY_EXECUTABLES.SYSTEM,
+    "nemo_rl.environments.genrm_environment.GenRMEnvironment": PY_EXECUTABLES.SYSTEM,
 }
 
 

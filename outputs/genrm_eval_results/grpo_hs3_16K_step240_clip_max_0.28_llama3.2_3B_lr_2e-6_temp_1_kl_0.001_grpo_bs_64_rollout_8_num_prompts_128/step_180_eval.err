@@ -1,0 +1,26 @@
+2025-06-13 10:48:11,991	INFO worker.py:1654 -- Connecting to existing Ray cluster at address: 10.65.12.135:28828...
+2025-06-13 10:48:12,998	INFO node.py:1084 -- Can't find a `node_ip_address.json` file from /tmp/ray/session_2025-06-13_10-45-43_629828_2567332. Have you started Ray instance using `ray start` or `ray.init`?
+2025-06-13 10:48:23,001	INFO node.py:1084 -- Can't find a `node_ip_address.json` file from /tmp/ray/session_2025-06-13_10-45-43_629828_2567332. Have you started Ray instance using `ray start` or `ray.init`?
+2025-06-13 10:48:33,004	INFO node.py:1084 -- Can't find a `node_ip_address.json` file from /tmp/ray/session_2025-06-13_10-45-43_629828_2567332. Have you started Ray instance using `ray start` or `ray.init`?
+2025-06-13 10:48:43,007	INFO node.py:1084 -- Can't find a `node_ip_address.json` file from /tmp/ray/session_2025-06-13_10-45-43_629828_2567332. Have you started Ray instance using `ray start` or `ray.init`?
+2025-06-13 10:48:53,010	INFO node.py:1084 -- Can't find a `node_ip_address.json` file from /tmp/ray/session_2025-06-13_10-45-43_629828_2567332. Have you started Ray instance using `ray start` or `ray.init`?
+2025-06-13 10:49:03,013	INFO node.py:1084 -- Can't find a `node_ip_address.json` file from /tmp/ray/session_2025-06-13_10-45-43_629828_2567332. Have you started Ray instance using `ray start` or `ray.init`?
+Traceback (most recent call last):
+  File "/lustre/fsw/portfolios/llmservice/users/yizhuj/NeMo-RL/examples/run_eval_genrm.py", line 409, in <module>
+    main()
+  File "/lustre/fsw/portfolios/llmservice/users/yizhuj/NeMo-RL/examples/run_eval_genrm.py", line 358, in main
+    init_ray()
+  File "/lustre/fsw/portfolios/llmservice/users/yizhuj/NeMo-RL/nemo_rl/distributed/virtual_cluster.py", line 94, in init_ray
+    ray.init(
+  File "/lustre/fsw/portfolios/llmservice/users/yizhuj/NeMo-RL/.venv/lib/python3.12/site-packages/ray/_private/client_mode_hook.py", line 103, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/lustre/fsw/portfolios/llmservice/users/yizhuj/NeMo-RL/.venv/lib/python3.12/site-packages/ray/_private/worker.py", line 1797, in init
+    _global_node = ray._private.node.Node(
+                   ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/lustre/fsw/portfolios/llmservice/users/yizhuj/NeMo-RL/.venv/lib/python3.12/site-packages/ray/_private/node.py", line 204, in __init__
+    node_ip_address = self._wait_and_get_for_node_address()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/lustre/fsw/portfolios/llmservice/users/yizhuj/NeMo-RL/.venv/lib/python3.12/site-packages/ray/_private/node.py", line 1091, in _wait_and_get_for_node_address
+    raise ValueError(
+ValueError: Can't find a `node_ip_address.json` file from /tmp/ray/session_2025-06-13_10-45-43_629828_2567332. for 60 seconds. A ray instance hasn't started. Did you do `ray start` or `ray.init` on this host?
