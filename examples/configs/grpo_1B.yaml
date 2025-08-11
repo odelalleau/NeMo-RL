@@ -178,6 +178,12 @@ env:
     #     4: 0.4    # Slightly worse
     #     5: 0.2   # Worse
     #     6: 0.0    # Much worse
+  vanilla_genrm: # Configuration for the Vanilla GenRM training environment
+    enable: false
+    num_workers: 16 # Number of parallel evaluation workers
+    score_weight: 1.0 # Weight for individual response scores (score_1, score_2)
+    ranking_weight: 2.0 # Weight for ranking accuracy
+    reasoning_split_word: "</think>" # Split word to separate reasoning from final output
   ifeval:
     num_workers: 8
     enable: false
