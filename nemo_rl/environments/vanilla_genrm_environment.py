@@ -157,7 +157,7 @@ class VanillaGenRMWorker:
         gt_ranking: Optional[int],
         config: VanillaGenRMConfig
     ) -> float:
-        """Calculate reward based on extracted scores vs ground truth using negative squared distance.
+        """Calculate reward based on extracted scores vs ground truth using negative L1 distance.
         Always evaluates both individual scores and ranking (combined approach).
         
         Args:
@@ -168,34 +168,34 @@ class VanillaGenRMWorker:
             config: Environment configuration
             
         Returns:
-            Calculated reward value (negative squared distance)
+            Calculated reward value (negative L1 distance)
         """
         if not extracted["parsing_success"]:
             return -100.0  # Large negative penalty if parsing failed
             
-        total_squared_distance = 0.0
+        total_l1_distance = 0.0
         num_components = 0
         
-        # Individual score accuracy using squared distance
+        # Individual score accuracy using L1 distance
         if gt_score_1 is not None and extracted["score_1"] is not None:
-            distance_1 = (float(extracted["score_1"]) - float(gt_score_1)) ** 2
-            total_squared_distance += distance_1 * config["score_weight"]
+            distance_1 = abs(float(extracted["score_1"]) - float(gt_score_1))
+            total_l1_distance += distance_1 * config["score_weight"]
             num_components += 1
             
         if gt_score_2 is not None and extracted["score_2"] is not None:
-            distance_2 = (float(extracted["score_2"]) - float(gt_score_2)) ** 2
-            total_squared_distance += distance_2 * config["score_weight"]
+            distance_2 = abs(float(extracted["score_2"]) - float(gt_score_2))
+            total_l1_distance += distance_2 * config["score_weight"]
             num_components += 1
         
-        # Ranking accuracy using squared distance
+        # Ranking accuracy using L1 distance
         if gt_ranking is not None and extracted["ranking"] is not None:
-            distance_ranking = (float(extracted["ranking"]) - float(gt_ranking)) ** 2
-            total_squared_distance += distance_ranking * config["ranking_weight"]
+            distance_ranking = abs(float(extracted["ranking"]) - float(gt_ranking))
+            total_l1_distance += distance_ranking * config["ranking_weight"]
             num_components += 1
         
-        # Return negative squared distance (higher rewards for smaller distances)
+        # Return negative L1 distance (higher rewards for smaller distances)
         if num_components > 0:
-            reward = -total_squared_distance
+            reward = -total_l1_distance
         else:
             reward = -100.0  # Large negative penalty if no valid components
             
