@@ -203,7 +203,7 @@ def main():
         val_dataset,
         task_to_env,
         val_task_to_env,
-    ) = setup_data(tokenizer, config["data"], config["env_configs"])
+    ) = setup_data(tokenizer, config["data"], config["env"])
 
     (
         policy,

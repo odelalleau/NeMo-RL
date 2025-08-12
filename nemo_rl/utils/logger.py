@@ -516,6 +516,12 @@ class Logger(LoggerInterface):
                     "environment",
                     "reward",
                     "dataset_name",
+                    "stage1_prompt",
+                    "stage1_response",
+                    "stage1_reward",
+                    "stage2_prompt",
+                    "stage2_response",
+                    "stage2_reward",
                 ]
             )
         )
@@ -537,6 +543,12 @@ class Logger(LoggerInterface):
                         "environment",
                         "reward",
                         "dataset_name",
+                        "stage1_prompt",
+                        "stage1_response",
+                        "stage1_reward",
+                        "stage2_prompt",
+                        "stage2_response",
+                        "stage2_reward",
                     ]
                 )
             )
@@ -626,7 +638,9 @@ class Logger(LoggerInterface):
         print(f"Logged data to {filepath}")
 
     def log_table_contents(
-        self, step, prompt, response, environment, reward, dataset_name, prefix
+        self, step, prompt, response, environment, reward, dataset_name, prefix,
+        stage1_prompt=None, stage1_response=None, stage1_reward=None,
+        stage2_prompt=None, stage2_response=None, stage2_reward=None
     ):
         if self.wandb_logger is None:
             return
@@ -638,6 +652,12 @@ class Logger(LoggerInterface):
             "environment": environment,
             "reward": reward,
             "dataset_name": dataset_name,
+            "stage1_prompt": stage1_prompt or "",
+            "stage1_response": stage1_response or "",
+            "stage1_reward": stage1_reward or 0.0,
+            "stage2_prompt": stage2_prompt or "",
+            "stage2_response": stage2_response or "",
+            "stage2_reward": stage2_reward or 0.0,
         }
 
         self.wandb_tables_df[prefix] = pd.concat(
@@ -663,6 +683,14 @@ class Logger(LoggerInterface):
 
             content = to_log["content"][dataset_idx]
             reward = to_log["rewards"][dataset_idx]
+            
+            # Extract parallel thinking fields if they exist
+            stage1_prompt = to_log.get("stage1_prompt", [None] * len(to_log["dataset_names"]))[dataset_idx]
+            stage1_response = to_log.get("stage1_response", [None] * len(to_log["dataset_names"]))[dataset_idx]
+            stage1_reward = to_log.get("stage1_reward", [None] * len(to_log["dataset_names"]))[dataset_idx]
+            stage2_prompt = to_log.get("stage2_prompt", [None] * len(to_log["dataset_names"]))[dataset_idx]
+            stage2_response = to_log.get("stage2_response", [None] * len(to_log["dataset_names"]))[dataset_idx]
+            stage2_reward = to_log.get("stage2_reward", [None] * len(to_log["dataset_names"]))[dataset_idx]
 
             table = self.log_table_contents(
                 step,
@@ -672,8 +700,17 @@ class Logger(LoggerInterface):
                 reward,
                 dataset,
                 prefix,
+                stage1_prompt=stage1_prompt,
+                stage1_response=stage1_response,
+                stage1_reward=stage1_reward,
+                stage2_prompt=stage2_prompt,
+                stage2_response=stage2_response,
+                stage2_reward=stage2_reward,
             )
 
+        if table:
+            self.wandb_logger.run.log({f"{prefix}/table": table}, step)
+            
         return table
 
     def __del__(self):

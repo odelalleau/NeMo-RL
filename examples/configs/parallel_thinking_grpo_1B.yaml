@@ -148,7 +148,7 @@ data:
 
   max_input_seq_length: ${policy.max_total_sequence_length}  # upper bound, real truncation occurs at vllm.max_model_len
 
-env_configs:
+env:
   # Vanilla GenRM is recommended for parallel thinking GRPO
   vanilla_genrm:
     enable: true

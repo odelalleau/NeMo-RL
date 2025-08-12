@@ -67,6 +67,74 @@ from nemo_rl.utils.timer import Timer
 # ===============================================================================
 # Helper Functions  
 # ===============================================================================
+def extract_parallel_thinking_log_data(
+    batch: BatchedDataDict[DatumSpec],
+    stage1_repeated_batch: BatchedDataDict[DatumSpec],
+    stage1_rewards: torch.Tensor,
+    stage2_repeated_batch: BatchedDataDict[DatumSpec],
+    stage2_rewards: torch.Tensor,
+    num_generations_per_prompt: int,
+) -> Dict[str, Any]:
+    """Extract comprehensive logging data for parallel thinking training.
+    
+    Returns a dictionary with stage1/stage2 prompts, responses, and rewards for each original prompt.
+    """
+    num_original_prompts = len(batch["message_log"])
+    
+    # Helper to extract prompt and response from message log
+    def extract_prompt_response(message_log):
+        prompt = None
+        response = None
+        for message in message_log:
+            if message["role"] == "user" and prompt is None:
+                prompt = message["content"]
+            elif message["role"] == "assistant":
+                response = message["content"]
+        return prompt or "", response or ""
+    
+    # Extract stage 1 data (first response for each original prompt)
+    stage1_prompts = []
+    stage1_responses = []
+    stage1_rewards_first = []
+    
+    for i in range(num_original_prompts):
+        first_gen_idx = i * num_generations_per_prompt
+        prompt, response = extract_prompt_response(stage1_repeated_batch["message_log"][first_gen_idx])
+        stage1_prompts.append(prompt)
+        stage1_responses.append(response)
+        stage1_rewards_first.append(stage1_rewards[first_gen_idx].item())
+    
+    # Extract stage 2 data
+    stage2_prompts = []
+    stage2_responses = []
+    stage2_rewards_first = []
+    num_stage2_prompts = len(stage2_repeated_batch["message_log"]) // num_generations_per_prompt
+    
+    for i in range(num_original_prompts):
+        if i < num_stage2_prompts:
+            first_gen_idx = i * num_generations_per_prompt
+            prompt, response = extract_prompt_response(stage2_repeated_batch["message_log"][first_gen_idx])
+            stage2_prompts.append(prompt)
+            stage2_responses.append(response)
+            stage2_rewards_first.append(stage2_rewards[first_gen_idx].item())
+        else:
+            stage2_prompts.append("N/A")
+            stage2_responses.append("N/A")
+            stage2_rewards_first.append(0.0)
+    
+    # Create log data with parallel thinking fields
+    log_data = {
+        "stage1_prompt": stage1_prompts,
+        "stage1_response": stage1_responses,
+        "stage1_reward": stage1_rewards_first,
+        "stage2_prompt": stage2_prompts,
+        "stage2_response": stage2_responses,
+        "stage2_reward": stage2_rewards_first,
+    }
+    
+    return log_data
+
+
 def apply_environment_post_processing(
     batch: BatchedDataDict[DatumSpec], 
     task_to_env: Dict[str, EnvironmentInterface],
@@ -190,7 +258,7 @@ def _default_pt_grpo_save_state() -> ParallelThinkingGRPOSaveState:
 class MasterConfig(TypedDict):
     policy: PolicyConfig
     loss_fn: ClippedPGLossConfig
-    env_configs: Dict[str, Any]
+    env: Dict[str, Any]
     data: DataConfig
     pt_grpo: ParallelThinkingGRPOConfig
     logger: LoggerConfig
@@ -760,7 +828,7 @@ def parallel_thinking_grpo_train(
                 num_generations = master_config["pt_grpo"]["num_generations_per_prompt"]
                 
                 # Get reasoning split word from any enabled environment
-                reasoning_split_word = get_reasoning_split_word(master_config["env_configs"])
+                reasoning_split_word = get_reasoning_split_word(master_config["env"])
                 
                 # Group responses by original prompt
                 stage1_responses = []
@@ -1069,10 +1137,26 @@ def parallel_thinking_grpo_train(
         print(f"  • Stage 2 Mean Gen Length: {rollout_metrics.get('stage2_mean_gen_tokens_per_sample', 0):.1f}")
 
         # Log training data samples
-        log_data = {"content": stage1_flat_messages["content"][:len(stage1_rewards)]}
-        log_data["stage1_rewards"] = stage1_rewards.tolist()
-        log_data["stage2_rewards"] = stage2_rewards.tolist()
+        # Use stage1_flat_messages content (just like grpo.py)
+        log_data = {"content": stage1_flat_messages["content"]}
+        log_data["rewards"] = stage1_rewards.tolist()
+        log_data["dataset_names"] = stage1_repeated_batch.get("dataset_names", ["default"] * len(stage1_rewards))
+        
+        # Add parallel thinking specific data
+        pt_data = extract_parallel_thinking_log_data(
+            batch=batch,
+            stage1_repeated_batch=stage1_repeated_batch,
+            stage1_rewards=stage1_rewards,
+            stage2_repeated_batch=stage2_repeated_batch,
+            stage2_rewards=stage2_rewards,
+            num_generations_per_prompt=master_config["pt_grpo"]["num_generations_per_prompt"],
+        )
+        log_data.update(pt_data)
+        
+        # Log to JSONL with full data
         logger.log_batched_dict_as_jsonl(log_data, f"train_data_step{step}.jsonl")
+        
+        # Log table with parallel thinking data
         table = logger.log_batched_dict_as_table(log_data, prefix="train", step=step)
 
         rollout_metrics["table"] = table

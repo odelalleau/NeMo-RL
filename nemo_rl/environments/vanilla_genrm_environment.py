@@ -44,6 +44,7 @@ class VanillaGenRMMetadata(TypedDict):
     score_1: Optional[int]  # Individual helpfulness score for response 1
     score_2: Optional[int]  # Individual helpfulness score for response 2
     ranking: Optional[int]  # Ranking score (1-6 scale)
+    question: Optional[str]
 
 
 @ray.remote
