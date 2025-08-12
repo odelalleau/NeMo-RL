@@ -1,0 +1,1321 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import os
+import random
+import time
+from collections import defaultdict
+from copy import deepcopy
+from dataclasses import dataclass
+from datetime import timedelta
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple, TypedDict, List
+
+import numpy as np
+import torch
+from torchdata.stateful_dataloader import StatefulDataLoader
+from transformers import AutoTokenizer
+
+from nemo_rl.algorithms.interfaces import LossFunction
+from nemo_rl.algorithms.loss_functions import (
+    ClippedPGLossConfig,
+    ClippedPGLossDataDict,
+    ClippedPGLossFn,
+)
+from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
+from nemo_rl.data import DataConfig
+from nemo_rl.data.datasets import AllTaskProcessedDataset, rl_collate_fn
+from nemo_rl.data.interfaces import (
+    DatumSpec,
+)
+from nemo_rl.data.llm_message_utils import (
+    batched_message_log_to_flat_message,
+    get_keys_from_message_log,
+)
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
+from nemo_rl.environments.interfaces import (
+    EnvironmentInterface,
+)
+from nemo_rl.experience.rollouts import run_multi_turn_rollout
+from nemo_rl.models.generation.interfaces import (
+    GenerationInterface,
+)
+from nemo_rl.models.generation.vllm import VllmGeneration
+from nemo_rl.models.interfaces import PolicyInterface
+from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.hf_policy import HfPolicy
+from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
+from nemo_rl.utils.logger import (
+    Logger,
+    LoggerConfig,
+    print_message_log_samples,
+)
+from nemo_rl.utils.timer import Timer
+
+
+# ===============================================================================
+# Helper Functions  
+# ===============================================================================
+def apply_environment_post_processing(
+    batch: BatchedDataDict[DatumSpec], 
+    task_to_env: Dict[str, EnvironmentInterface],
+    prefix: str = ""
+) -> Tuple[BatchedDataDict[DatumSpec], Dict[str, Any]]:
+    """Apply environment post-processing to a batch.
+    
+    Args:
+        batch: Batch containing completed rollout data
+        task_to_env: Dictionary mapping task names to their corresponding environments
+        prefix: Optional prefix for metric names (e.g., "val_" for validation metrics)
+        
+    Returns:
+        Tuple of (original_batch, environment_metrics)
+        
+    Note:
+        This function only collects metrics from environment post-processing.
+        The batch is returned unchanged since training data was already processed during rollouts.
+    """
+    import ray
+    
+    env_metrics = {}
+    
+    # Collect futures for all environment post-processing calls
+    futures = []
+    task_info = []  # Store task_name for each future
+    
+    for task_name, env in task_to_env.items():
+        # Find indices for this task type
+        task_indices = [i for i, name in enumerate(batch["task_name"]) if name == task_name]
+        if task_indices:
+            # Create a sub-batch for this task
+            task_batch = batch.select_indices(task_indices)
+            
+            # Apply environment post-processing (Ray remote call)
+            future = env.global_post_process_and_metrics.remote(task_batch)
+            futures.append(future)
+            task_info.append(task_name)
+    
+    # Get results and collect only metrics (ignore processed batches)
+    if futures:
+        results = ray.get(futures)
+        
+        # Process results - only collect metrics, ignore batch modifications
+        for task_name, (_, task_env_metrics) in zip(task_info, results):
+            # Collect metrics with appropriate prefix
+            metric_prefix = f"{prefix}{task_name}/env_" if prefix else f"{task_name}/env_"
+            env_metrics.update({f"{metric_prefix}{k}": v for k, v in task_env_metrics.items()})
+    
+    # Return original batch unchanged, just with additional metrics
+    return batch, env_metrics
+
+
+# ===============================================================================
+# Configuration
+# ===============================================================================
+@dataclass
+class TimeLimitTimer:
+    """Timer to tell us when the time limit is reached"""
+
+    duration: Optional[str]
+
+    def __post_init__(self):
+        self._duration = float("inf")
+
+        if self.duration is not None:
+            days, hours, mins, seconds = map(int, self.duration.strip().split(":"))
+            self._duration = timedelta(
+                days=days, hours=hours, minutes=mins, seconds=seconds
+            ).total_seconds()
+
+    def start_time(self):
+        self._start_time = time.monotonic()
+
+    def get_time_elapsed(self):
+        return time.monotonic() - self._start_time
+
+    def get_time_remaining(self):
+        return self._duration - self.get_time_elapsed()
+
+    def is_finished(self):
+        time_left = self.get_time_remaining()
+        return time_left <= 0
+
+
+class ParallelThinkingGRPOConfig(TypedDict):
+    num_prompts_per_step: int
+    num_generations_per_prompt: int
+    normalize_rewards: bool
+    use_leave_one_out_baseline: bool
+    val_period: int
+    val_batch_size: int
+    val_at_start: bool
+    checkpoint_dir: str
+    num_epochs: int
+    max_rollout_turns: int
+    max_val_samples: int
+    num_val_repeats: int  # Number of validation generations per prompt
+    time_limit: Optional[str]  # Time limit in format "days:hours:mins:seconds"
+    check_baseline_correctness: bool  # Enable baseline correctness assertions
+    # Parallel thinking specific configuration
+    aggregation_prompt_template: str  # Template for aggregation prompts
+
+
+class ParallelThinkingGRPOSaveState(TypedDict):
+    step: int
+    optim_step: int
+    val_reward: float
+    consumed_samples: int
+
+
+def _default_pt_grpo_save_state() -> ParallelThinkingGRPOSaveState:
+    return {
+        "step": 0,
+        "optim_step": 0,
+        "val_reward": -99999999.0,
+        "consumed_samples": 0,
+    }
+
+
+class MasterConfig(TypedDict):
+    policy: PolicyConfig
+    loss_fn: ClippedPGLossConfig
+    env_configs: Dict[str, Any]
+    data: DataConfig
+    pt_grpo: ParallelThinkingGRPOConfig
+    logger: LoggerConfig
+    cluster: ClusterConfig
+    checkpointing: CheckpointingConfig
+
+
+# ===============================================================================
+# Setup & Initialization
+# ===============================================================================
+
+
+def setup(
+    master_config: MasterConfig,
+    tokenizer: AutoTokenizer,
+    dataset: AllTaskProcessedDataset,
+    val_dataset: Optional[AllTaskProcessedDataset],
+) -> Tuple[
+    PolicyInterface,
+    GenerationInterface,
+    RayVirtualCluster,
+    StatefulDataLoader,
+    Optional[StatefulDataLoader],
+    ClippedPGLossFn,
+    Logger,
+    CheckpointManager,
+    ParallelThinkingGRPOSaveState,
+    MasterConfig,
+]:
+    """Main entry point for running Parallel Thinking GRPO algorithm.
+
+    Returns:
+        Tuple of policy, cluster, dataloader, tokenizer, loss_fn, logger, checkpointer, save_state, master_config, val_dataloader
+    """
+    # Extract individual configs for easier access
+    policy_config = master_config["policy"]
+    generation_config = master_config["policy"]["generation"]
+    loss_config = master_config["loss_fn"]
+    data_config = master_config["data"]
+    pt_grpo_config = master_config["pt_grpo"]
+    logger_config = master_config["logger"]
+    cluster_config = master_config["cluster"]
+
+    # ==========================
+    #         Logger
+    # ==========================
+    logger = Logger(logger_config)
+    logger.log_hyperparams(master_config)
+
+    # ==========================
+    #      Checkpointing
+    # ==========================
+    checkpointer = CheckpointManager(master_config["checkpointing"])
+    last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    pt_grpo_save_state: Optional[ParallelThinkingGRPOSaveState] = checkpointer.load_training_info(
+        last_checkpoint_path
+    )
+    if pt_grpo_save_state is None:
+        pt_grpo_save_state = _default_pt_grpo_save_state()
+
+    # config validation checks
+    if master_config["checkpointing"]["enabled"]:
+        assert master_config["checkpointing"]["save_period"] > 0
+        assert (
+            master_config["checkpointing"]["save_period"]
+            % master_config["pt_grpo"]["val_period"]
+            == 0
+        ), (
+            f"Checkpointing save period {master_config['checkpointing']['save_period']} "
+            f"must be a multiple of validation period {master_config['pt_grpo']['val_period']}"
+            f", or we won't know what metric to save!"
+        )
+
+    # ==========================
+    #           Data
+    # ==========================
+    shuffle_train = master_config["data"]["train"]["shuffle"]
+    shuffle_val = master_config["data"]["val"]["shuffle"]
+
+    train_data_generator = None
+    val_data_generator = None
+
+    if shuffle_train:
+        train_data_generator = torch.Generator()
+        train_data_generator.manual_seed(master_config["data"]["train"]["seed"])
+
+    if shuffle_val:
+        val_data_generator = torch.Generator()
+        val_data_generator.manual_seed(master_config["data"]["val"]["seed"])
+
+    dataloader = StatefulDataLoader(
+        dataset,
+        batch_size=pt_grpo_config["num_prompts_per_step"],
+        shuffle=shuffle_train,
+        generator=train_data_generator,
+        collate_fn=rl_collate_fn,
+        drop_last=master_config["data"]["train"]["drop_last"],
+    )
+    if last_checkpoint_path is not None:
+        dataloader_state_dict = torch.load(
+            os.path.join(last_checkpoint_path, "train_dataloader.pt")
+        )
+        dataloader.load_state_dict(dataloader_state_dict)
+
+    print(f"  ✓ Training dataloader loaded with {len(dataset)} samples")
+
+    # Load validation dataset if provided
+    val_dataloader = None
+    # If validation is enabled, load the validation dataloader
+    if pt_grpo_config["val_period"] > 0 or pt_grpo_config["val_at_start"]:
+        val_batch_size = min(master_config["pt_grpo"]["max_val_samples"], len(val_dataset))
+        if "val_batch_size" in master_config["pt_grpo"]:
+            print("val batch size is specified but we don't actually use it anymore")
+
+        val_dataloader = StatefulDataLoader(
+            val_dataset,
+            batch_size=val_batch_size,
+            shuffle=shuffle_val,
+            collate_fn=rl_collate_fn,
+            generator=val_data_generator,
+            drop_last=master_config["data"]["val"]["drop_last"],
+        )
+        print(f"  ✓ Validation dataloader loaded with {len(val_dataset)} samples")
+
+    # ==========================
+    #          Cluster
+    # ==========================
+    print("\n▶ Setting up compute cluster...")
+    colocated_inference = generation_config["backend"] != "hf"
+    cluster = RayVirtualCluster(
+        name="pt_grpo_policy_cluster",
+        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
+        * cluster_config["num_nodes"],
+        use_gpus=True,
+        num_gpus_per_node=cluster_config["gpus_per_node"],
+        max_colocated_worker_groups=2 if colocated_inference else 1,
+    )
+    print(f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes")
+
+    # ==========================
+    #   Training and Inference
+    # ==========================
+    print("\n▶ Setting up model and training...")
+
+    # vllm model loading prefers clean environment, initialize policy_generation before policy
+    backend = generation_config["backend"]
+    generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
+
+    if backend == "hf":
+        policy_generation = None
+        print(f"  ✓ Using HF backend for generation with {policy_config['model_name']}")
+    elif backend == "vllm":
+        policy_generation = VllmGeneration(cluster=cluster, config=generation_config)
+        # Worker groups are not initialized until the first call to run something on workergroups.
+        policy_generation.finish_generation()
+        print(
+            f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}"
+        )
+
+    policy = HfPolicy(
+        cluster=cluster,
+        config=policy_config,
+        tokenizer=tokenizer,
+        weights_path=Path(last_checkpoint_path) / "policy" / "weights"
+        if last_checkpoint_path
+        else None,
+        optimizer_path=Path(last_checkpoint_path) / "policy" / "optimizer"
+        if last_checkpoint_path
+        else None,
+        init_optimizer=True,
+    )
+
+    loss_fn = ClippedPGLossFn(loss_config)
+
+    print("\n" + "=" * 60)
+    print(" " * 18 + "SETUP COMPLETE")
+    print("=" * 60 + "\n")
+
+    return (
+        policy,
+        policy_generation,
+        cluster,
+        dataloader,
+        val_dataloader,
+        loss_fn,
+        logger,
+        checkpointer,
+        pt_grpo_save_state,
+        master_config,
+    )
+
+
+def get_reasoning_split_word(env_configs: Dict[str, Any]) -> Optional[str]:
+    """Get reasoning_split_word from any enabled environment."""
+    for env_name, env_config in env_configs.items():
+        if env_config.get("enable", False) and "reasoning_split_word" in env_config:
+            return env_config["reasoning_split_word"]
+    return None
+
+
+def create_aggregation_prompts(
+    original_batch: BatchedDataDict[DatumSpec],
+    stage1_responses: List[List[str]],
+    aggregation_prompt_template: str,
+    tokenizer,
+) -> BatchedDataDict[DatumSpec]:
+    """Create aggregation prompts by combining original prompts with stage 1 responses.
+    
+    Args:
+        original_batch: Original batch containing the prompts
+        stage1_responses: List of lists, where each inner list contains the stage 1 responses for a prompt
+        aggregation_prompt_template: Template string for formatting aggregation prompts
+        tokenizer: Tokenizer to use for tokenizing the aggregation prompts
+    
+    Returns:
+        New batch with aggregation prompts
+    """
+    aggregation_batch = deepcopy(original_batch)
+    
+    # Create new message logs for aggregation
+    new_message_logs = []
+    new_extra_env_info = []
+    new_loss_multiplier = []
+    new_task_name = []
+    
+    for i, message_log in enumerate(original_batch["message_log"]):
+        # Skip if no responses for this prompt
+        if len(stage1_responses[i]) == 0:
+            continue
+            
+        # Extract the original user question from metadata
+        if "extra_env_info" not in original_batch or not original_batch["extra_env_info"][i]:
+            raise ValueError(f"No extra_env_info found in batch for sample {i}")
+        
+        original_prompt = original_batch["extra_env_info"][i].get("question")
+        if original_prompt is None:
+            raise ValueError(f"No question found in metadata for sample {i}")
+        
+        # Format the stage 1 responses
+        responses_text = ""
+        for j, response in enumerate(stage1_responses[i]):
+            responses_text += f"<Solution {j+1}>\n{response}\n</Solution {j+1}>\n"
+        
+        # Create the aggregation prompt using the template
+        aggregation_prompt = aggregation_prompt_template.format(
+            original_prompt=original_prompt,
+            responses=responses_text.strip()
+        )
+        
+        # Create a proper message structure for chat template
+        aggregation_message = [
+            {
+                "role": "user",
+                "content": aggregation_prompt,
+            }
+        ]
+        
+        # Apply chat template to get properly formatted content and token_ids
+        formatted_content = tokenizer.apply_chat_template(
+            aggregation_message,
+            tokenize=False,
+            add_generation_prompt=True,
+            add_special_tokens=False,
+        )
+        token_ids = tokenizer.apply_chat_template(
+            aggregation_message,
+            tokenize=True,
+            add_generation_prompt=True,
+            add_special_tokens=False,
+            return_tensors="pt",
+        )[0]
+        
+        # Create new message log with the aggregation prompt
+        new_message_log = [
+            {
+                "role": "user",
+                "content": formatted_content,
+                "token_ids": token_ids,
+            }
+        ]
+        new_message_logs.append(new_message_log)
+    
+        # Keep track of corresponding metadata
+        new_extra_env_info.append(original_batch["extra_env_info"][i])
+        new_loss_multiplier.append(original_batch["loss_multiplier"][i])
+        new_task_name.append(original_batch["task_name"][i])
+    
+    # Ensure we have at least some valid aggregation prompts
+    if len(new_message_logs) == 0:
+        raise ValueError("No valid aggregation prompts could be created from the stage 1 responses")
+    
+    print(f"  ✓ Created {len(new_message_logs)} aggregation prompts from {len(original_batch['message_log'])} original prompts")
+    
+    # Update aggregation batch with new data
+    aggregation_batch["message_log"] = new_message_logs
+    aggregation_batch["extra_env_info"] = new_extra_env_info
+    aggregation_batch["loss_multiplier"] = torch.tensor(new_loss_multiplier)
+    aggregation_batch["task_name"] = new_task_name
+    
+    return aggregation_batch
+
+
+def combine_and_shuffle_training_data(
+    stage1_train_data: BatchedDataDict[ClippedPGLossDataDict],
+    stage2_train_data: BatchedDataDict[ClippedPGLossDataDict],
+) -> BatchedDataDict[ClippedPGLossDataDict]:
+    """Combine training data from both stages and shuffle.
+    
+    Note: Stage 2 (aggregation) sequences are typically longer than stage 1, so we pad stage 1 data to match.
+    The combined data is shuffled to mix stage 1 and stage 2 samples.
+    """
+    
+    # Get sequence lengths
+    stage1_seq_len = stage1_train_data["input_ids"].shape[1]
+    stage2_seq_len = stage2_train_data["input_ids"].shape[1]
+    
+    # Pad the shorter sequence to match the longer one
+    if stage1_seq_len < stage2_seq_len:
+        pad_size = stage2_seq_len - stage1_seq_len
+        stage1_train_data["input_ids"] = torch.nn.functional.pad(
+            stage1_train_data["input_ids"], (0, pad_size), value=0
+        )
+        stage1_train_data["advantages"] = torch.nn.functional.pad(
+            stage1_train_data["advantages"], (0, pad_size), value=0
+        )
+        stage1_train_data["generation_logprobs"] = torch.nn.functional.pad(
+            stage1_train_data["generation_logprobs"], (0, pad_size), value=0
+        )
+        stage1_train_data["token_mask"] = torch.nn.functional.pad(
+            stage1_train_data["token_mask"], (0, pad_size), value=0
+        )
+    elif stage2_seq_len < stage1_seq_len:
+        pad_size = stage1_seq_len - stage2_seq_len
+        stage2_train_data["input_ids"] = torch.nn.functional.pad(
+            stage2_train_data["input_ids"], (0, pad_size), value=0
+        )
+        stage2_train_data["advantages"] = torch.nn.functional.pad(
+            stage2_train_data["advantages"], (0, pad_size), value=0
+        )
+        stage2_train_data["generation_logprobs"] = torch.nn.functional.pad(
+            stage2_train_data["generation_logprobs"], (0, pad_size), value=0
+        )
+        stage2_train_data["token_mask"] = torch.nn.functional.pad(
+            stage2_train_data["token_mask"], (0, pad_size), value=0
+        )
+    
+    # Now concatenate the tensors (both have same sequence length)
+    combined_data = BatchedDataDict[ClippedPGLossDataDict]({
+        "input_ids": torch.cat([stage1_train_data["input_ids"], stage2_train_data["input_ids"]], dim=0),
+        "input_lengths": torch.cat([stage1_train_data["input_lengths"], stage2_train_data["input_lengths"]], dim=0),
+        "advantages": torch.cat([stage1_train_data["advantages"], stage2_train_data["advantages"]], dim=0),
+        "generation_logprobs": torch.cat([stage1_train_data["generation_logprobs"], stage2_train_data["generation_logprobs"]], dim=0),
+        "token_mask": torch.cat([stage1_train_data["token_mask"], stage2_train_data["token_mask"]], dim=0),
+        "sample_mask": torch.cat([stage1_train_data["sample_mask"], stage2_train_data["sample_mask"]], dim=0),
+    })
+    
+    # Shuffle the combined data to mix stage 1 and stage 2 samples
+    total_samples = combined_data["input_ids"].shape[0]
+    shuffle_indices = torch.randperm(total_samples)
+    
+    # Apply shuffle to all tensors
+    combined_data["input_ids"] = combined_data["input_ids"][shuffle_indices]
+    combined_data["input_lengths"] = combined_data["input_lengths"][shuffle_indices]
+    combined_data["advantages"] = combined_data["advantages"][shuffle_indices]
+    combined_data["generation_logprobs"] = combined_data["generation_logprobs"][shuffle_indices]
+    combined_data["token_mask"] = combined_data["token_mask"][shuffle_indices]
+    combined_data["sample_mask"] = combined_data["sample_mask"][shuffle_indices]
+    
+    return combined_data
+
+
+def refit_policy_generation(
+    policy: PolicyInterface,
+    policy_generation: GenerationInterface,
+    refit_buffer_size_gb: int,  # GB
+):
+    """Refit the policy generation interface with the latest policy weights."""
+    policy.offload_before_refit()
+    policy_generation.prepare_for_generation(tags=["weights"])
+    # Streaming update weights to save memory
+    state_dict_info = policy.prepare_weights_for_ipc()
+    # group keys to save time
+    available_bytes = refit_buffer_size_gb * (1024**3)
+    split_keys, keys = [], []
+    for key, size_in_bytes in state_dict_info:
+        if size_in_bytes > available_bytes:
+            if keys:
+                split_keys.append(keys)
+                keys = []
+            available_bytes = refit_buffer_size_gb * (1024**3)
+
+        keys.append(key)
+        available_bytes -= size_in_bytes
+
+    if len(keys) > 0:
+        split_keys.append(keys)
+    # do update
+    for keys in split_keys:
+        ipc_handles = policy.get_weights_ipc_handles(keys)
+        if not policy_generation.update_weights(ipc_handles):
+            error_message = (
+                "❌ Error: Updating weights for the generation policy failed during refit.\n"
+                "This often indicates an issue with cuda-ipc or "
+                "a problem within the generation backend (e.g., vLLM worker).\n"
+            )
+            raise RuntimeError(error_message)
+    policy.offload_after_refit()
+    policy_generation.prepare_for_generation(tags=["kv_cache"])
+
+
+# ===============================================================================
+# Training & Validation
+# ===============================================================================
+
+
+def parallel_thinking_grpo_train(
+    policy: PolicyInterface,
+    policy_generation: Optional[GenerationInterface],
+    dataloader: StatefulDataLoader,
+    val_dataloader: Optional[StatefulDataLoader],
+    tokenizer,
+    loss_fn: LossFunction,
+    task_to_env: Dict[str, EnvironmentInterface],
+    val_task_to_env: Optional[Dict[str, EnvironmentInterface]],
+    logger: Logger,
+    checkpointer: CheckpointManager,
+    pt_grpo_save_state: Optional[ParallelThinkingGRPOSaveState],
+    master_config: MasterConfig,
+):
+    """Run Parallel Thinking GRPO training algorithm."""
+    timer = Timer()
+    NEED_REFIT = True
+    # If policy_generation is None, use the policy as the generation interface (hf framework backend)
+    if policy_generation is None:
+        policy_generation = policy
+        NEED_REFIT = False
+    POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
+
+    # common config/state items
+    step = pt_grpo_save_state["step"]
+    optim_step = pt_grpo_save_state["optim_step"]
+
+    consumed_samples = pt_grpo_save_state["consumed_samples"]
+    val_period = master_config["pt_grpo"]["val_period"]
+    val_at_start = master_config["pt_grpo"]["val_at_start"]
+    refit_buffer_size_gb = master_config["policy"]["refit_buffer_size_gb"]
+
+    num_epochs = master_config["pt_grpo"]["num_epochs"]
+    max_num_steps = num_epochs * len(dataloader)
+
+    # Initialize time limit timer
+    time_limit_timer = TimeLimitTimer(master_config["pt_grpo"].get("time_limit"))
+    time_limit_timer.start_time()
+
+    # Run validation at the start if configured
+    if val_at_start and step == 0:
+        print("\n🔍 Running initial validation...")
+        if NEED_REFIT and POLICY_GENERATION_STALE:
+            refit_policy_generation(policy, policy_generation, refit_buffer_size_gb)
+            POLICY_GENERATION_STALE = False
+        else:
+            policy_generation.prepare_for_generation()
+        val_metrics, validation_timings = validate(
+            policy_generation,
+            val_dataloader,
+            tokenizer,
+            val_task_to_env,
+            step=0,
+            master_config=master_config,
+            logger=logger,
+        )
+        policy_generation.finish_generation()
+        logger.log_metrics(val_metrics, step, prefix="validation")
+        logger.log_metrics(validation_timings, step, prefix="timing/validation")
+
+    # Run parallel thinking GRPO training
+    batch: BatchedDataDict[DatumSpec]
+    iter_dataloader = iter(dataloader)
+
+    while step < max_num_steps and not time_limit_timer.is_finished():
+        try:
+            batch = next(iter_dataloader)
+        except StopIteration:
+            iter_dataloader = iter(dataloader)
+            batch = next(iter_dataloader)
+
+        print(f"\n{'=' * 25} Step {step + 1}/{max_num_steps} {'=' * 25}")
+        val_metrics, validation_timings = None, None
+
+        with timer.time("total_step_time"):
+            # ============== Stage 1: Normal Generation ==============
+            print("\n▶ Stage 1: Normal Generation...")
+            with timer.time("stage1_preparation"):
+                # Repeat batch items for multiple generations
+                stage1_repeated_batch: BatchedDataDict[DatumSpec] = batch.repeat_interleave(
+                    master_config["pt_grpo"]["num_generations_per_prompt"]
+                )
+                # Convert LLMMessageLogType to FlatMessagesType for generation and save prompt ids
+                batched_flat_pre_gen, input_lengths = batched_message_log_to_flat_message(
+                    stage1_repeated_batch["message_log"],
+                    pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                )
+                stage1_prompt_input_ids = batched_flat_pre_gen["token_ids"]  # prompt-only ids (no assistant)
+
+            # Generate responses for stage 1
+            print(f"  • Generating {stage1_repeated_batch.size} stage 1 responses...")
+            with timer.time("stage1_generation_prep"):
+                if NEED_REFIT and POLICY_GENERATION_STALE:
+                    refit_policy_generation(
+                        policy,
+                        policy_generation,
+                        refit_buffer_size_gb,
+                    )
+                    POLICY_GENERATION_STALE = False
+                else:
+                    policy_generation.prepare_for_generation()
+
+            with timer.time("stage1_generation"):
+                stage1_repeated_batch, stage1_rollout_metrics = run_multi_turn_rollout(
+                    policy_generation=policy_generation,
+                    input_batch=stage1_repeated_batch,
+                    tokenizer=tokenizer,
+                    task_to_env=task_to_env,
+                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
+                    max_rollout_turns=master_config["pt_grpo"]["max_rollout_turns"],
+                    greedy=False,
+                )
+                
+                # Keep generation active for stage 2
+
+            # Apply environment post-processing for stage 1
+            print("  • Applying stage 1 environment post-processing...")
+            with timer.time("stage1_env_post_processing"):
+                stage1_repeated_batch, stage1_env_metrics = apply_environment_post_processing(
+                    stage1_repeated_batch, task_to_env, prefix="stage1_"
+                )
+                stage1_rollout_metrics.update(stage1_env_metrics)
+
+            # Get dataset specific pass at k for stage 1
+            stage1_prompt_based_reward_dict = defaultdict(list)
+            stage1_idx_dictionary = defaultdict(list)
+            if "dataset_names" in stage1_repeated_batch and "idx" in stage1_repeated_batch:
+                for dataset, r, idx in zip(
+                    stage1_repeated_batch["dataset_names"],
+                    stage1_repeated_batch["total_reward"],
+                    stage1_repeated_batch["idx"],
+                ):
+                    stage1_prompt_based_reward_dict[dataset].append(r)
+                    stage1_idx_dictionary[dataset].append(idx)
+
+                for dataset, rewards in stage1_prompt_based_reward_dict.items():
+                    rewards_tensor = torch.as_tensor(rewards, dtype=torch.float32).view(
+                        -1, master_config["pt_grpo"]["num_generations_per_prompt"]
+                    )
+                    stage1_rollout_metrics[
+                        f"stage1_{dataset}/pass_at_{master_config['pt_grpo']['num_generations_per_prompt']}"
+                    ] = (rewards_tensor > 0).any(-1).float().mean()
+
+            # Extract stage 1 responses and rewards
+            stage1_rewards = stage1_repeated_batch["total_reward"]
+            
+            # ============== Stage 2: Aggregation ==============
+            print("\n▶ Stage 2: Aggregation...")
+            with timer.time("stage2_preparation"):
+                # Extract stage 1 responses grouped by original prompt
+                num_prompts = len(batch["message_log"])
+                num_generations = master_config["pt_grpo"]["num_generations_per_prompt"]
+                
+                # Get reasoning split word from any enabled environment
+                reasoning_split_word = get_reasoning_split_word(master_config["env_configs"])
+                
+                # Group responses by original prompt
+                stage1_responses = []
+                for i in range(num_prompts):
+                    prompt_responses = []
+                    for j in range(num_generations):
+                        idx = i * num_generations + j
+                        # Extract assistant response from the message log
+                        last_assistant_response = None
+                        for message in stage1_repeated_batch["message_log"][idx]:
+                            if message["role"] == "assistant":
+                                last_assistant_response = message["content"]
+                        if last_assistant_response is not None:
+                            if reasoning_split_word and reasoning_split_word in last_assistant_response:
+                                # Remove reasoning part if split word exists
+                                prompt_responses.append(last_assistant_response.split(reasoning_split_word)[-1].lstrip())
+                            else:
+                                prompt_responses.append(last_assistant_response)
+                    
+                    # Randomly select a subset of responses for aggregation
+                    num_to_select = random.randint(1, len(prompt_responses))
+                    selected_responses = random.sample(prompt_responses, num_to_select)
+                    stage1_responses.append(selected_responses)
+                
+                # Create aggregation prompts
+                aggregation_batch_template = create_aggregation_prompts(
+                    batch,
+                    stage1_responses, 
+                    master_config["pt_grpo"]["aggregation_prompt_template"],
+                    tokenizer,
+                )
+                
+                # Repeat aggregation batch for multiple generations
+                stage2_repeated_batch = aggregation_batch_template.repeat_interleave(
+                    master_config["pt_grpo"]["num_generations_per_prompt"]
+                )
+                
+                # Calculate input_ids for stage 2
+                stage2_flat_pre_rollout, stage2_input_lengths = batched_message_log_to_flat_message(
+                    stage2_repeated_batch["message_log"],
+                    pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                )
+                stage2_prompt_input_ids = stage2_flat_pre_rollout["token_ids"]
+
+            print(f"  • Generating {stage2_repeated_batch.size} stage 2 aggregation responses...")
+            with timer.time("stage2_generation"):
+                stage2_repeated_batch, stage2_rollout_metrics = run_multi_turn_rollout(
+                    policy_generation=policy_generation,
+                    input_batch=stage2_repeated_batch,
+                    tokenizer=tokenizer,
+                    task_to_env=task_to_env,
+                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
+                    max_rollout_turns=master_config["pt_grpo"]["max_rollout_turns"],
+                    greedy=False,
+                )
+                
+                policy_generation.finish_generation()
+
+            # Apply environment post-processing for stage 2
+            print("  • Applying stage 2 environment post-processing...")
+            with timer.time("stage2_env_post_processing"):
+                stage2_repeated_batch, stage2_env_metrics = apply_environment_post_processing(
+                    stage2_repeated_batch, task_to_env, prefix="stage2_"
+                )
+                stage2_rollout_metrics.update(stage2_env_metrics)
+
+            # Get dataset specific pass at k for stage 2
+            stage2_prompt_based_reward_dict = defaultdict(list)
+            stage2_idx_dictionary = defaultdict(list)
+            if "dataset_names" in stage2_repeated_batch and "idx" in stage2_repeated_batch:
+                for dataset, r, idx in zip(
+                    stage2_repeated_batch["dataset_names"],
+                    stage2_repeated_batch["total_reward"],
+                    stage2_repeated_batch["idx"],
+                ):
+                    stage2_prompt_based_reward_dict[dataset].append(r)
+                    stage2_idx_dictionary[dataset].append(idx)
+
+                for dataset, rewards in stage2_prompt_based_reward_dict.items():
+                    rewards_tensor = torch.as_tensor(rewards, dtype=torch.float32).view(
+                        -1, master_config["pt_grpo"]["num_generations_per_prompt"]
+                    )
+                    stage2_rollout_metrics[
+                        f"stage2_{dataset}/pass_at_{master_config['pt_grpo']['num_generations_per_prompt']}"
+                    ] = (rewards_tensor > 0).any(-1).float().mean()
+
+            # Extract stage 2 rewards
+            stage2_rewards = stage2_repeated_batch["total_reward"]
+
+            # ============== Calculate Rewards & Advantages ==============
+            print("\n▶ Processing rewards and advantages...")
+            with timer.time("reward_calculation"):
+                # Stage 1 advantages
+                print("  • Computing stage 1 advantages...")
+                
+                # Check for potentially problematic configuration
+                expected_responses = master_config["pt_grpo"]["num_generations_per_prompt"] if master_config["pt_grpo"].get("check_baseline_correctness", True) else None
+                
+                stage1_baseline, stage1_std, stage1_metrics = calculate_baseline_and_std_per_prompt(
+                    stage1_prompt_input_ids,
+                    stage1_rewards,
+                    torch.ones_like(stage1_rewards),
+                    leave_one_out_baseline=master_config["pt_grpo"]["use_leave_one_out_baseline"],
+                    expected_responses_per_prompt=expected_responses,
+                )
+                stage1_advantages = (stage1_rewards - stage1_baseline).unsqueeze(-1)
+
+                # Stage 2 advantages
+                print("  • Computing stage 2 advantages...")
+                stage2_baseline, stage2_std, stage2_metrics = calculate_baseline_and_std_per_prompt(
+                    stage2_prompt_input_ids,
+                    stage2_rewards,
+                    torch.ones_like(stage2_rewards),
+                    leave_one_out_baseline=master_config["pt_grpo"]["use_leave_one_out_baseline"],
+                    expected_responses_per_prompt=expected_responses,
+                )
+                stage2_advantages = (stage2_rewards - stage2_baseline).unsqueeze(-1)
+
+                # Normalize rewards if configured
+                if master_config["pt_grpo"]["normalize_rewards"]:
+                    # Stage 1 normalization
+                    zero_std_mask = stage1_std > 0
+                    stage1_advantages[zero_std_mask] = (
+                        stage1_advantages[zero_std_mask] / stage1_std.unsqueeze(-1)[zero_std_mask]
+                    )
+
+                    # Stage 2 normalization
+                    zero_std_mask = stage2_std > 0
+                    stage2_advantages[zero_std_mask] = (
+                        stage2_advantages[zero_std_mask] / stage2_std.unsqueeze(-1)[zero_std_mask]
+                    )
+
+                # Combine all rewards and advantages for metrics
+                all_rewards = torch.cat([stage1_rewards, stage2_rewards])
+                all_advantages = torch.cat([stage1_advantages.flatten(), stage2_advantages.flatten()])
+                
+                # Calculate metrics
+                rollout_metrics = {}
+                rollout_metrics.update({"stage1_" + k: v for k, v in stage1_rollout_metrics.items()})
+                rollout_metrics.update({"stage2_" + k: v for k, v in stage2_rollout_metrics.items()})
+                rollout_metrics.update({"stage1_" + k: v for k, v in stage1_metrics.items()})
+                rollout_metrics.update({"stage2_" + k: v for k, v in stage2_metrics.items()})
+                
+                # Stage-specific metrics
+                rollout_metrics.update({
+                    "stage1_reward_min": stage1_rewards.min(),
+                    "stage1_reward_mean": stage1_rewards.mean(),
+                    "stage1_reward_max": stage1_rewards.max(),
+                    "stage1_baseline_mean": stage1_baseline.mean(),
+                    "stage1_std_mean": stage1_std.mean(),
+                    "stage2_reward_min": stage2_rewards.min(),
+                    "stage2_reward_mean": stage2_rewards.mean(),
+                    "stage2_reward_max": stage2_rewards.max(),
+                    "stage2_baseline_mean": stage2_baseline.mean(),
+                    "stage2_std_mean": stage2_std.mean(),
+                    "combined_reward_min": all_rewards.min(),
+                    "combined_reward_mean": all_rewards.mean(),
+                    "combined_reward_max": all_rewards.max(),
+                    "percent_zero_advantages": (all_advantages == 0).float().mean(),
+                })
+
+            # ============== Prepare Training Data ==============
+            print("\n▶ Preparing training data...")
+            with timer.time("data_processing"):
+                # Prepare stage 1 training data
+                for i, message_log in enumerate(stage1_repeated_batch["message_log"]):
+                    for j, message in enumerate(message_log):
+                        if message["role"] == "assistant":
+                            message["token_loss_mask"] = torch.ones_like(message["token_ids"])
+                        else:
+                            message["token_loss_mask"] = torch.zeros_like(message["token_ids"])
+                        if "generation_logprobs" not in message:
+                            message["generation_logprobs"] = torch.zeros_like(
+                                message["token_ids"], dtype=torch.float32
+                            )
+                        message["advantages"] = stage1_advantages[i].expand(message["token_ids"].shape)
+
+                # Convert stage 1 to training data
+                stage1_flat_messages, stage1_input_lengths = batched_message_log_to_flat_message(
+                    stage1_repeated_batch["message_log"],
+                    pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                    make_sequence_length_divisible_by=master_config["policy"]["make_sequence_length_divisible_by"],
+                )
+
+                stage1_train_data = BatchedDataDict[ClippedPGLossDataDict]({
+                    "input_ids": stage1_flat_messages["token_ids"],
+                    "input_lengths": stage1_input_lengths,
+                    "advantages": stage1_flat_messages["advantages"],
+                    "generation_logprobs": stage1_flat_messages["generation_logprobs"],
+                    "token_mask": stage1_flat_messages["token_loss_mask"],
+                    "sample_mask": stage1_repeated_batch["loss_multiplier"],
+                })
+
+                # Prepare stage 2 training data
+                for i, message_log in enumerate(stage2_repeated_batch["message_log"]):
+                    for j, message in enumerate(message_log):
+                        if message["role"] == "assistant":
+                            message["token_loss_mask"] = torch.ones_like(message["token_ids"])
+                        else:
+                            message["token_loss_mask"] = torch.zeros_like(message["token_ids"])
+                        if "generation_logprobs" not in message:
+                            message["generation_logprobs"] = torch.zeros_like(
+                                message["token_ids"], dtype=torch.float32
+                            )
+                        message["advantages"] = stage2_advantages[i].expand(message["token_ids"].shape)
+
+                # Convert stage 2 to training data
+                stage2_flat_messages, stage2_input_lengths = batched_message_log_to_flat_message(
+                    stage2_repeated_batch["message_log"],
+                    pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                    make_sequence_length_divisible_by=master_config["policy"]["make_sequence_length_divisible_by"],
+                )
+
+                stage2_train_data = BatchedDataDict[ClippedPGLossDataDict]({
+                    "input_ids": stage2_flat_messages["token_ids"],
+                    "input_lengths": stage2_input_lengths,
+                    "advantages": stage2_flat_messages["advantages"],
+                    "generation_logprobs": stage2_flat_messages["generation_logprobs"],
+                    "token_mask": stage2_flat_messages["token_loss_mask"],
+                    "sample_mask": stage2_repeated_batch["loss_multiplier"],
+                })
+
+                # Combine and shuffle training data from both stages
+                train_data = combine_and_shuffle_training_data(stage1_train_data, stage2_train_data)
+                train_data.to("cpu")
+
+            # ============== Policy Update ==============
+            print("\n▶ Updating policy...")
+            with timer.time("logprob_inference_prep"):
+                policy.prepare_for_lp_inference()
+
+            with timer.time("policy_and_reference_logprobs"):
+                fprop_logprobs = policy.get_logprobs(train_data)["logprobs"]
+                reference_logprobs = policy.get_reference_policy_logprobs(train_data)["reference_logprobs"]
+                train_data["prev_logprobs"] = fprop_logprobs
+                train_data["reference_policy_logprobs"] = reference_logprobs
+
+            with timer.time("training_prep"):
+                policy.prepare_for_training()  # set model train and reload optim to GPU
+                POLICY_GENERATION_STALE = True
+
+            with timer.time("policy_training"):
+                list_of_train_metrics = policy.train(train_data, loss_fn)
+
+            is_last_step = step + 1 == max_num_steps
+
+            # Run validation if it's a validation step
+            if is_last_step or (val_period > 0 and (step + 1) % val_period == 0):
+                if NEED_REFIT and POLICY_GENERATION_STALE:
+                    refit_policy_generation(
+                        policy,
+                        policy_generation,
+                        refit_buffer_size_gb,
+                    )
+                    POLICY_GENERATION_STALE = False
+                else:
+                    policy_generation.prepare_for_generation()
+                val_metrics, validation_timings = validate(
+                    policy_generation,
+                    val_dataloader,
+                    tokenizer,
+                    val_task_to_env,
+                    step=step + 1,
+                    master_config=master_config,
+                    logger=logger,
+                )
+                policy_generation.finish_generation()
+                logger.log_metrics(validation_timings, step + 1, prefix="timing/validation")
+                logger.log_metrics(val_metrics, step + 1, prefix="validation")
+
+            ## Checkpointing
+            consumed_samples += master_config["pt_grpo"]["num_prompts_per_step"]
+            if master_config["checkpointing"]["enabled"] and (
+                is_last_step
+                or (step + 1) % master_config["checkpointing"]["save_period"] == 0
+            ):
+                policy.prepare_for_training()
+
+                pt_grpo_save_state["step"] = step + 1
+                pt_grpo_save_state["val_reward"] = val_metrics["accuracy"] if val_metrics else 0.0
+                pt_grpo_save_state["consumed_samples"] = consumed_samples
+                pt_grpo_save_state["optim_step"] = optim_step + len(list_of_train_metrics)
+                with timer.time("checkpointing"):
+                    print(f"  • Saving checkpoint for step {step + 1}...")
+                    checkpoint_path = checkpointer.init_tmp_checkpoint(
+                        step + 1, pt_grpo_save_state, master_config
+                    )
+                    policy.save_checkpoint(
+                        weights_path=os.path.join(checkpoint_path, "policy", "weights"),
+                        optimizer_path=os.path.join(checkpoint_path, "policy", "optimizer"),
+                        tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
+                    )
+                    torch.save(
+                        dataloader.state_dict(),
+                        os.path.join(checkpoint_path, "train_dataloader.pt"),
+                    )
+                    checkpointer.finalize_checkpoint(checkpoint_path)
+                policy.offload_after_refit()
+
+        # ============== Logging ==============
+        print("\n📊 Training Results:")
+        print(f"  • Combined Avg Reward: {all_rewards.mean():.4f}")
+        print(f"  • Stage 1 Avg Reward: {stage1_rewards.mean():.4f}")
+        print(f"  • Stage 2 Avg Reward: {stage2_rewards.mean():.4f}")
+        print(f"  • Stage 1 Mean Gen Length: {rollout_metrics.get('stage1_mean_gen_tokens_per_sample', 0):.1f}")
+        print(f"  • Stage 2 Mean Gen Length: {rollout_metrics.get('stage2_mean_gen_tokens_per_sample', 0):.1f}")
+
+        # Log training data samples
+        log_data = {"content": stage1_flat_messages["content"][:len(stage1_rewards)]}
+        log_data["stage1_rewards"] = stage1_rewards.tolist()
+        log_data["stage2_rewards"] = stage2_rewards.tolist()
+        logger.log_batched_dict_as_jsonl(log_data, f"train_data_step{step}.jsonl")
+        table = logger.log_batched_dict_as_table(log_data, prefix="train", step=step)
+
+        rollout_metrics["table"] = table
+        timing_metrics = timer.get_timing_metrics(reduction_op="sum")
+
+        print("\n⏱️  Timing:")
+        total_time = timing_metrics.get("total_step_time", 0)
+        print(f"  • Total step time: {total_time:.2f}s")
+
+        for k, v in sorted(timing_metrics.items(), key=lambda item: item[1], reverse=True):
+            if k != "total_step_time":
+                percent = (v / total_time * 100) if total_time > 0 else 0
+                print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
+
+        for i, train_step_metric in enumerate(list_of_train_metrics):
+            train_step_metric["optim_step"] = optim_step + i + 1
+            train_step_metric["outer_loop_step"] = step + 1
+            logger.log_metrics(
+                train_step_metric,
+                train_step_metric["optim_step"],
+                prefix="train",
+            )
+
+        logger.log_metrics(rollout_metrics, step + 1, prefix="train_rollout")
+        logger.log_metrics(timing_metrics, step + 1, prefix="timing/train")
+
+        timer.reset()
+        step += 1
+        optim_step += len(list_of_train_metrics)
+
+        if step >= max_num_steps:
+            break
+
+
+def validate(
+    policy_generation: GenerationInterface,
+    val_dataloader: StatefulDataLoader,
+    tokenizer,
+    val_task_to_env: Dict[str, EnvironmentInterface],
+    step: int,
+    master_config: MasterConfig,
+    logger: Optional[Logger] = None,
+    num_repeats: Optional[int] = None,
+    return_data_for_saving: bool = False,
+    return_val_batch: bool = False,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Run validation on the validation dataset."""
+    if val_dataloader is None:
+        print("  ⚠️ No validation dataloader provided, skipping validation")
+        if return_val_batch:
+            return {}, {}, [], None
+        elif return_data_for_saving:
+            return {}, {}, []
+        else:
+            return {}, {}
+
+    timer = Timer()
+    with timer.time("total_validation_time"):
+        print(f"\n🔍 Running validation at step {step}...")
+
+        # Get num_val_repeats from config or parameter
+        if num_repeats is None:
+            num_repeats = master_config["pt_grpo"].get("num_val_repeats", 1)
+        
+        total_rewards = []
+        all_message_logs = []
+        data_for_saving = []
+
+        try:
+            val_batch = next(iter(val_dataloader)).repeat_interleave(num_repeats)
+        except StopIteration:
+            print("  No validation data, skipping validation")
+            if return_val_batch:
+                return {}, {}, [], None
+            elif return_data_for_saving:
+                return {}, {}, []
+            else:
+                return {}, {}
+
+        # Generate responses
+        val_batch, gen_metrics = run_multi_turn_rollout(
+            policy_generation,
+            val_batch,
+            tokenizer,
+            val_task_to_env,
+            max_seq_len=master_config["policy"]["max_total_sequence_length"],
+            max_rollout_turns=master_config["pt_grpo"]["max_rollout_turns"],
+            greedy=False,
+        )
+
+        # Apply environment post-processing for validation
+        val_batch, val_env_metrics = apply_environment_post_processing(
+            val_batch, val_task_to_env, prefix="val_"
+        )
+        gen_metrics.update(val_env_metrics)
+
+        # Collect message logs for later display
+        to_env = [
+            get_keys_from_message_log(val_batch["message_log"][i], ["role", "content"])
+            for i in range(len(val_batch["message_log"]))
+        ]
+        all_message_logs.extend(to_env)
+        total_rewards.extend(val_batch["total_reward"].tolist())
+
+        if return_data_for_saving:
+            # Transpose val_batch from batch-first to sample-first
+            batch_size = val_batch.size
+            repeat_idx_counter = defaultdict(int)
+            for i in range(batch_size):
+                sample_dict = {}
+                for k, v in val_batch.items():
+                    # hack to use the env stuff
+                    if k == "message_log":
+                        v = to_env
+
+                    val = v[i]
+                    if torch.is_tensor(val):
+                        val = val.item()
+                    sample_dict[k] = val
+
+                    if k == "idx":
+                        repeat_idx = repeat_idx_counter[val]
+                        repeat_idx_counter[val] += 1
+
+                sample_dict["eval_idx"] = f"{sample_dict['idx']}_{repeat_idx}"
+                data_for_saving.append(sample_dict)
+
+        # Log one example for each unique dataset
+        unique_datasets = list(set(val_batch.get("dataset_names", ["default"])))
+        table = None
+
+        for dataset_name in unique_datasets:
+            if "dataset_names" in val_batch:
+                dataset_idx = val_batch["dataset_names"].index(dataset_name)
+            else:
+                dataset_idx = 0
+
+            for interaction in val_batch["message_log"][dataset_idx]:
+                if interaction["role"] == "user":
+                    prompt = interaction["content"]
+                elif interaction["role"] == "assistant":
+                    response = interaction["content"]
+                else:
+                    environment = interaction["content"]
+
+            reward = val_batch["total_reward"][dataset_idx].item()
+
+            if logger is not None:
+                table = logger.log_table_contents(
+                    step,
+                    prompt,
+                    response,
+                    environment,
+                    reward,
+                    dataset_name,
+                    f"validation/{dataset_name}",
+                )
+
+        val_metrics = {
+            "table": table,
+        }
+        val_metrics.update(gen_metrics)
+
+        # Calculate dataset-specific pass@k metrics
+        if "dataset_names" in val_batch and "idx" in val_batch:
+            prompt_based_reward_dict = defaultdict(list)
+            idx_dictionary = defaultdict(list)
+            for dataset, r, idx in zip(
+                val_batch["dataset_names"], val_batch["total_reward"], val_batch["idx"]
+            ):
+                prompt_based_reward_dict[dataset].append(r)
+                idx_dictionary[dataset].append(idx)
+
+            for dataset, rewards in prompt_based_reward_dict.items():
+                rewards_tensor = torch.as_tensor(rewards, dtype=torch.float32).view(
+                    -1, num_repeats
+                )
+                val_metrics[f"{dataset}/pass_at_{num_repeats}"] = (
+                    (rewards_tensor > 0).any(-1).float().mean()
+                )
+
+        # Print message log samples
+        try:
+            print_message_log_samples(
+                all_message_logs,
+                total_rewards,
+                num_samples=min(
+                    master_config["logger"]["num_val_samples_to_print"],
+                    len(all_message_logs),
+                ),
+                step=step,
+            )
+        except Exception as e:
+            print(f"\n  ⚠️ Error displaying message samples: {str(e)}")
+            print("  ⚠️ Continuing validation without displaying samples...")
+
+        # Calculate validation metrics
+        val_metrics["accuracy"] = val_batch["total_reward"].mean().item()
+        val_metrics["mean_reward"] = val_batch["total_reward"].mean().item()
+        val_metrics["mean_length"] = gen_metrics.get("mean_gen_tokens_per_sample", 0)
+        val_metrics["num_samples"] = len(val_batch["total_reward"])
+
+        print(f"  ✓ Validation complete: mean_reward={val_metrics['mean_reward']:.4f}, accuracy={val_metrics['accuracy']:.4f}")
+
+    # Get timing metrics
+    timing_metrics = timer.get_timing_metrics(reduction_op="sum")
+    validation_time = timing_metrics.get("total_validation_time", 0)
+
+    # Print timing information
+    print("\n  ⏱️  Validation Timing:")
+    print(f"    • Total validation time: {validation_time:.2f}s")
+
+    # Make sure to reset the timer after validation
+    timer.reset()
+    
+    if return_val_batch:
+        # add token loss mask
+        for i, message_log in enumerate(val_batch["message_log"]):
+            for j, message in enumerate(message_log):
+                if message["role"] == "assistant":
+                    message["token_loss_mask"] = torch.ones_like(message["token_ids"])
+                else:
+                    message["token_loss_mask"] = torch.zeros_like(message["token_ids"])
+
+        flat_messages, input_lengths = batched_message_log_to_flat_message(
+            val_batch["message_log"],
+            pad_value_dict={"token_ids": tokenizer.pad_token_id},
+            make_sequence_length_divisible_by=master_config["policy"][
+                "make_sequence_length_divisible_by"
+            ],
+        )
+
+        # Create validation data
+        val_data = BatchedDataDict[ClippedPGLossDataDict](
+            {
+                "input_ids": flat_messages["token_ids"],
+                "input_lengths": input_lengths,
+                "token_mask": flat_messages["token_loss_mask"],
+            }
+        )
+        val_data.to("cpu")
+        return val_metrics, timing_metrics, data_for_saving, val_data
+    elif return_data_for_saving:
+        return val_metrics, timing_metrics, data_for_saving
+    else:
+        return val_metrics, timing_metrics 
