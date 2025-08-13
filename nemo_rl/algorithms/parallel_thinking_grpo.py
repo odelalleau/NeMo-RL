@@ -237,6 +237,9 @@ class ParallelThinkingGRPOConfig(TypedDict):
     check_baseline_correctness: bool  # Enable baseline correctness assertions
     # Parallel thinking specific configuration
     aggregation_prompt_template: str  # Template for aggregation prompts
+    skip_stage1_env_post_processing: bool # Skip environment post-processing for stage 1
+    skip_stage2_env_post_processing: bool # Skip environment post-processing for stage 2
+    skip_val_env_post_processing: bool # Skip environment post-processing for validation
 
 
 class ParallelThinkingGRPOSaveState(TypedDict):
@@ -792,9 +795,13 @@ def parallel_thinking_grpo_train(
             # Apply environment post-processing for stage 1
             print("  • Applying stage 1 environment post-processing...")
             with timer.time("stage1_env_post_processing"):
-                stage1_repeated_batch, stage1_env_metrics = apply_environment_post_processing(
-                    stage1_repeated_batch, task_to_env, prefix="stage1_"
-                )
+                if master_config["pt_grpo"].get("skip_stage1_env_post_processing", False):
+                    stage1_env_metrics = {}
+                    print("    (Skipped - skip_stage1_env_post_processing is enabled)")
+                else:
+                    stage1_repeated_batch, stage1_env_metrics = apply_environment_post_processing(
+                        stage1_repeated_batch, task_to_env, prefix="stage1_"
+                    )
                 stage1_rollout_metrics.update(stage1_env_metrics)
 
             # Get dataset specific pass at k for stage 1
@@ -891,9 +898,13 @@ def parallel_thinking_grpo_train(
             # Apply environment post-processing for stage 2
             print("  • Applying stage 2 environment post-processing...")
             with timer.time("stage2_env_post_processing"):
-                stage2_repeated_batch, stage2_env_metrics = apply_environment_post_processing(
-                    stage2_repeated_batch, task_to_env, prefix="stage2_"
-                )
+                if master_config["pt_grpo"].get("skip_stage2_env_post_processing", False):
+                    stage2_env_metrics = {}
+                    print("    (Skipped - skip_stage2_env_post_processing is enabled)")
+                else:
+                    stage2_repeated_batch, stage2_env_metrics = apply_environment_post_processing(
+                        stage2_repeated_batch, task_to_env, prefix="stage2_"
+                    )
                 stage2_rollout_metrics.update(stage2_env_metrics)
 
             # Get dataset specific pass at k for stage 2
@@ -1272,9 +1283,13 @@ def validate(
         )
 
         # Apply environment post-processing for validation
-        val_batch, val_env_metrics = apply_environment_post_processing(
-            val_batch, val_task_to_env, prefix="val_"
-        )
+        if master_config["pt_grpo"].get("skip_val_env_post_processing", False):
+            val_env_metrics = {}
+            print("    (Skipped - skip_val_env_post_processing is enabled)")
+        else:
+            val_batch, val_env_metrics = apply_environment_post_processing(
+                val_batch, val_task_to_env, prefix="val_"
+            )
         gen_metrics.update(val_env_metrics)
 
         # Collect message logs for later display
