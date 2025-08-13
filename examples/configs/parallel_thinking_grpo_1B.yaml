@@ -5,15 +5,21 @@ pt_grpo:
   max_rollout_turns: 1  # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
   
   # Parallel thinking specific configuration
-  aggregation_prompt_template: |
-    Given the following problem and multiple solution attempts, analyze each solution for correctness and provide a single, best final answer.
+  aggregation_prompt_template: |-
+    You are given a problem and multiple solution attempts. Your task is to synthesize the best insights into a single, comprehensive final answer.
     
-    Problem: {original_prompt}
+    **PROBLEM:**
+    {original_prompt}
     
-    Solution attempts:
+    **SOLUTION ATTEMPTS:**
     {responses}
     
-    Please analyze the above solutions and provide the single best answer. If multiple solutions are correct, choose the clearest one. If all solutions are incorrect, provide the correct answer.
+    **INSTRUCTIONS:**
+    1. Carefully analyze each solution attempt above
+    2. Identify the strengths and correct elements in each solution
+    3. Note any errors, weaknesses, or incomplete parts
+    4. Synthesize the best insights from all solutions into a single answer
+    5. If all solutions are incorrect, provide the correct answer yourself
   
   # Note: Generation length is controlled by policy.generation.max_new_tokens
   # Both stages use the same max_new_tokens value from the generation config
