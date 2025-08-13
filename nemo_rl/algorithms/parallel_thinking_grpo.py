@@ -849,7 +849,8 @@ def parallel_thinking_grpo_train(
                                 prompt_responses.append(last_assistant_response)
                     
                     # Randomly select a subset of responses for aggregation
-                    num_to_select = random.randint(1, len(prompt_responses))
+                    # Only select powers of 2: 1, 2, 4, 8, etc.
+                    num_to_select = random.choice([2**i for i in range(len(prompt_responses).bit_length()) if 2**i <= len(prompt_responses)])
                     selected_responses = random.sample(prompt_responses, num_to_select)
                     stage1_responses.append(selected_responses)
                 
@@ -917,6 +918,27 @@ def parallel_thinking_grpo_train(
 
             # Extract stage 2 rewards
             stage2_rewards = stage2_repeated_batch["total_reward"]
+
+            # Calculate stage2_better_than_stage1_avg_rate metric (vectorized, strict shape check)
+            # Enforce that Stage 2 has the same number of prompts as Stage 1; otherwise raise an error.
+            stage2_num_prompts = stage2_rewards.numel() // num_generations if stage2_rewards.numel() > 0 else 0
+            if stage2_num_prompts != num_prompts:
+                raise ValueError(
+                    f"Stage 2 prompt count ({stage2_num_prompts}) does not match Stage 1 prompt count ({num_prompts}). "
+                    "Likely some prompts produced zero valid Stage 1 responses and were skipped during aggregation."
+                )
+
+            # Group rewards by prompt
+            stage1_rewards_by_prompt = stage1_rewards.view(num_prompts, num_generations)
+            stage2_rewards_by_prompt = stage2_rewards.view(num_prompts, num_generations)
+
+            # Average stage1 rewards per prompt
+            stage1_avg_rewards_per_prompt = stage1_rewards_by_prompt.mean(dim=1, keepdim=True)
+
+            # Compare each stage2 response to its prompt's stage1 average and take overall mean
+            stage2_better_than_stage1_avg_rate = (
+                (stage2_rewards_by_prompt > stage1_avg_rewards_per_prompt).float().mean().item()
+            )
 
             # ============== Calculate Rewards & Advantages ==============
             print("\n▶ Processing rewards and advantages...")
@@ -988,6 +1010,7 @@ def parallel_thinking_grpo_train(
                     "combined_reward_mean": all_rewards.mean(),
                     "combined_reward_max": all_rewards.max(),
                     "percent_zero_advantages": (all_advantages == 0).float().mean(),
+                    "stage2_better_than_stage1_avg_rate": stage2_better_than_stage1_avg_rate,
                 })
 
             # ============== Prepare Training Data ==============
@@ -1133,6 +1156,7 @@ def parallel_thinking_grpo_train(
         print(f"  • Combined Avg Reward: {all_rewards.mean():.4f}")
         print(f"  • Stage 1 Avg Reward: {stage1_rewards.mean():.4f}")
         print(f"  • Stage 2 Avg Reward: {stage2_rewards.mean():.4f}")
+        print(f"  • Stage 2 Better Than Stage 1 Avg Rate: {stage2_better_than_stage1_avg_rate:.2%}")
         print(f"  • Stage 1 Mean Gen Length: {rollout_metrics.get('stage1_mean_gen_tokens_per_sample', 0):.1f}")
         print(f"  • Stage 2 Mean Gen Length: {rollout_metrics.get('stage2_mean_gen_tokens_per_sample', 0):.1f}")
 
