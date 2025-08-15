@@ -851,9 +851,9 @@ def parallel_thinking_grpo_train(
                         if last_assistant_response is not None:
                             if reasoning_split_word and reasoning_split_word in last_assistant_response:
                                 # Remove reasoning part if split word exists
-                                prompt_responses.append(last_assistant_response.split(reasoning_split_word)[-1].lstrip())
+                                prompt_responses.append(last_assistant_response.split(reasoning_split_word)[-1].lstrip()[:6000])
                             else:
-                                prompt_responses.append(last_assistant_response)
+                                prompt_responses.append(last_assistant_response[:6000])
                     
                     # Randomly select a subset of responses for aggregation
                     # Only select powers of 2: 1, 2, 4, 8, etc.
