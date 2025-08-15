@@ -240,6 +240,10 @@ class ParallelThinkingGRPOConfig(TypedDict):
     skip_stage1_env_post_processing: bool # Skip environment post-processing for stage 1
     skip_stage2_env_post_processing: bool # Skip environment post-processing for stage 2
     skip_val_env_post_processing: bool # Skip environment post-processing for validation
+    # Stage 2 reward shaping
+    enable_stage2_reward_shaping: bool  # Enable bonus rewards for stage2 that outperforms stage1
+    stage2_outperform_bonus_weight: float  # Weight for bonus when stage2 > stage1_avg (e.g., 0.5)
+    stage2_bonus_to_rewards: bool  # If True, add bonus to rewards before advantage calc; if False, add to advantages
 
 
 class ParallelThinkingGRPOSaveState(TypedDict):
@@ -954,6 +958,44 @@ def parallel_thinking_grpo_train(
             # ============== Calculate Rewards & Advantages ==============
             print("\n▶ Processing rewards and advantages...")
             with timer.time("reward_calculation"):
+                # Apply stage2 reward shaping if enabled (before advantage calculation if configured)
+                stage2_bonuses = None
+                if master_config["pt_grpo"].get("enable_stage2_reward_shaping", False) and master_config["pt_grpo"].get("stage2_bonus_to_rewards", False):
+                    print("  • Applying stage 2 reward bonuses (to rewards)...")
+                    
+                    # Get configuration parameters
+                    outperform_bonus_weight = master_config["pt_grpo"].get("stage2_outperform_bonus_weight", 1)
+                    
+                    # Calculate bonuses for each stage2 response
+                    stage2_bonuses = torch.zeros_like(stage2_rewards)
+                    
+                    for prompt_idx in range(num_prompts):
+                        # Get stage1 rewards for this prompt
+                        prompt_stage1_rewards = stage1_rewards_by_prompt[prompt_idx]
+                        prompt_stage1_avg = stage1_avg_rewards_per_prompt[prompt_idx].item()
+                        
+                        # Get stage2 rewards for this prompt
+                        prompt_stage2_rewards = stage2_rewards_by_prompt[prompt_idx]
+                        
+                        for gen_idx in range(num_generations):
+                            stage2_reward = prompt_stage2_rewards[gen_idx].item()
+                            
+                            # Basic bonus: stage2 outperforms stage1 average
+                            if stage2_reward > prompt_stage1_avg:
+                                bonus = outperform_bonus_weight * (stage2_reward - prompt_stage1_avg)
+                                stage2_bonuses[prompt_idx * num_generations + gen_idx] = bonus
+                    
+                    # Add bonuses to rewards BEFORE advantage calculation
+                    stage2_rewards = stage2_rewards + stage2_bonuses
+                    stage2_rewards_by_prompt = stage2_rewards.view(num_prompts, num_generations)
+                    
+                    # Log metrics about the bonuses
+                    num_outperform = (stage2_bonuses > 0).float().sum().item()
+                    avg_bonus = stage2_bonuses[stage2_bonuses > 0].mean().item() if num_outperform > 0 else 0.0
+                    
+                    print(f"    • Stage2 responses outperforming stage1: {num_outperform}/{len(stage2_rewards)} ({num_outperform/len(stage2_rewards)*100:.1f}%)")
+                    print(f"    • Average bonus for outperforming responses: {avg_bonus:.4f}")
+                
                 # Stage 1 advantages
                 print("  • Computing stage 1 advantages...")
                 
@@ -979,6 +1021,42 @@ def parallel_thinking_grpo_train(
                     expected_responses_per_prompt=expected_responses,
                 )
                 stage2_advantages = (stage2_rewards - stage2_baseline).unsqueeze(-1)
+
+                # Apply stage2 reward shaping to advantages if enabled and not already applied to rewards
+                if master_config["pt_grpo"].get("enable_stage2_reward_shaping", False) and not master_config["pt_grpo"].get("stage2_bonus_to_rewards", False):
+                    print("  • Applying stage 2 reward bonuses (to advantages)...")
+                    
+                    # Get configuration parameters
+                    outperform_bonus_weight = master_config["pt_grpo"].get("stage2_outperform_bonus_weight", 0.5)
+                    
+                    # Calculate bonuses for each stage2 response
+                    stage2_bonuses = torch.zeros_like(stage2_rewards)
+                    
+                    for prompt_idx in range(num_prompts):
+                        # Get stage1 rewards for this prompt
+                        prompt_stage1_rewards = stage1_rewards_by_prompt[prompt_idx]
+                        prompt_stage1_avg = stage1_avg_rewards_per_prompt[prompt_idx].item()
+                        
+                        # Get stage2 rewards for this prompt
+                        prompt_stage2_rewards = stage2_rewards_by_prompt[prompt_idx]
+                        
+                        for gen_idx in range(num_generations):
+                            stage2_reward = prompt_stage2_rewards[gen_idx].item()
+                            
+                            # Basic bonus: stage2 outperforms stage1 average
+                            if stage2_reward > prompt_stage1_avg:
+                                bonus = outperform_bonus_weight * (stage2_reward - prompt_stage1_avg)
+                                stage2_bonuses[prompt_idx * num_generations + gen_idx] = bonus
+                    
+                    # Add bonuses to advantages AFTER baseline calculation
+                    stage2_advantages = stage2_advantages + stage2_bonuses.unsqueeze(-1)
+                    
+                    # Log metrics about the bonuses
+                    num_outperform = (stage2_bonuses > 0).float().sum().item()
+                    avg_bonus = stage2_bonuses[stage2_bonuses > 0].mean().item() if num_outperform > 0 else 0.0
+                    
+                    print(f"    • Stage2 responses outperforming stage1: {num_outperform}/{len(stage2_rewards)} ({num_outperform/len(stage2_rewards)*100:.1f}%)")
+                    print(f"    • Average bonus for outperforming responses: {avg_bonus:.4f}")
 
                 # Normalize rewards if configured
                 if master_config["pt_grpo"]["normalize_rewards"]:
@@ -1023,6 +1101,14 @@ def parallel_thinking_grpo_train(
                     "percent_zero_advantages": (all_advantages == 0).float().mean(),
                     "stage2_better_than_stage1_avg_rate": stage2_better_than_stage1_avg_rate,
                 })
+                
+                # Add stage2 reward shaping metrics if enabled
+                if master_config["pt_grpo"].get("enable_stage2_reward_shaping", False) and stage2_bonuses is not None:
+                    rollout_metrics.update({
+                        "stage2_bonus_rate": (stage2_bonuses > 0).float().mean(),
+                        "stage2_avg_bonus": stage2_bonuses[stage2_bonuses > 0].mean() if (stage2_bonuses > 0).any() else 0.0,
+                        "stage2_max_bonus": stage2_bonuses.max(),
+                    })
 
             # ============== Prepare Training Data ==============
             print("\n▶ Preparing training data...")
