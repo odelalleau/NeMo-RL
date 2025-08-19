@@ -21,6 +21,12 @@ pt_grpo:
     4. Synthesize the best insights from all solutions into a single answer
     5. If all solutions are incorrect, provide the correct answer yourself
   
+  # Best@k training configuration for Stage 1
+  # This optimizes for the best reward among k samples to encourage exploration
+  use_best_at_k_for_stage1: false  # Set to true to enable Best@k training
+  best_at_k_k: 4  # Number of samples per bootstrap group (should be <= num_generations_per_prompt)
+  best_at_k_m: 100  # Number of bootstrap groups (will use C(n,k) if smaller)
+  
   # Note: Generation length is controlled by policy.generation.max_new_tokens
   # Both stages use the same max_new_tokens value from the generation config
 

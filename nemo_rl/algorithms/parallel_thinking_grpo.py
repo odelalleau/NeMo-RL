@@ -14,12 +14,14 @@
 import os
 import random
 import time
+import math
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, TypedDict, List
+from itertools import combinations
 
 import numpy as np
 import torch
@@ -135,6 +137,149 @@ def extract_parallel_thinking_log_data(
     return log_data
 
 
+def calculate_best_at_k_advantages_bootstrap(
+    rewards: torch.Tensor,
+    num_prompts: int,
+    num_generations_per_prompt: int,
+    k: int,
+    m: int,
+    normalize: bool = False,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """Calculate Best@k advantages using bootstrap sampling.
+    
+    Args:
+        rewards: Tensor of shape (num_prompts * num_generations_per_prompt,) containing rewards
+        num_prompts: Number of original prompts
+        num_generations_per_prompt: Number of generations per prompt (n)
+        k: Number of samples to select in each group
+        m: Number of bootstrap groups to create
+        normalize: Whether to normalize advantages
+        
+    Returns:
+        Tuple of (advantages, metrics) where advantages has same shape as rewards
+    """
+    # Validate k
+    if k > num_generations_per_prompt:
+        raise ValueError(f"k ({k}) cannot be greater than num_generations_per_prompt ({num_generations_per_prompt})")
+    
+    # Calculate maximum possible unique groups
+    max_unique_groups = math.comb(num_generations_per_prompt, k)
+    
+    # Decide sampling strategy
+    use_all_combinations = max_unique_groups <= m
+    effective_m = max_unique_groups if use_all_combinations else m
+    
+    if use_all_combinations:
+        print(f"    Using all C({num_generations_per_prompt},{k})={max_unique_groups} unique combinations (< m={m})")
+    else:
+        print(f"    Bootstrap sampling m={m} groups from C({num_generations_per_prompt},{k})={max_unique_groups} possible combinations")
+    
+    # Reshape rewards to (num_prompts, num_generations_per_prompt)
+    rewards_by_prompt = rewards.view(num_prompts, num_generations_per_prompt)
+    
+    # Initialize advantages with zeros
+    advantages = torch.zeros_like(rewards, dtype=torch.float32)
+    
+    # Metrics to track
+    group_rewards_all = []
+    
+    # Process each prompt separately
+    for prompt_idx in range(num_prompts):
+        prompt_rewards = rewards_by_prompt[prompt_idx]
+        prompt_advantages = torch.zeros(num_generations_per_prompt, dtype=torch.float32)
+        
+        # Track which groups each sample belongs to
+        sample_group_memberships = [[] for _ in range(num_generations_per_prompt)]
+        group_rewards = []
+        
+        if use_all_combinations:
+            # Generate all unique combinations
+            all_indices = list(range(num_generations_per_prompt))
+            all_combinations = list(combinations(all_indices, k))
+            
+            for group_idx, sampled_indices in enumerate(all_combinations):
+                sampled_indices_tensor = torch.tensor(sampled_indices, dtype=torch.long)
+                
+                # Get the best reward in this group
+                group_reward = prompt_rewards[sampled_indices_tensor].max().item()
+                group_rewards.append(group_reward)
+                
+                # Track which samples are in this group
+                for idx in sampled_indices:
+                    sample_group_memberships[idx].append(group_idx)
+        else:
+            # Original bootstrap sampling with duplicate detection
+            seen_combinations = set()
+            actual_groups_created = 0
+            attempts = 0
+            max_attempts = m * 3  # Prevent infinite loop
+            
+            while actual_groups_created < m and attempts < max_attempts:
+                attempts += 1
+                
+                # Randomly sample k indices without replacement
+                sampled_indices = torch.randperm(num_generations_per_prompt)[:k]
+                
+                # Check if we've seen this combination before
+                indices_tuple = tuple(sorted(sampled_indices.tolist()))
+                if indices_tuple in seen_combinations:
+                    continue
+                seen_combinations.add(indices_tuple)
+                
+                # Get the best reward in this group
+                group_reward = prompt_rewards[sampled_indices].max().item()
+                group_rewards.append(group_reward)
+                
+                # Track which samples are in this group
+                for idx in sampled_indices:
+                    sample_group_memberships[idx.item()].append(actual_groups_created)
+                
+                actual_groups_created += 1
+        
+        # Calculate baseline and advantages for groups
+        group_rewards_tensor = torch.tensor(group_rewards, dtype=torch.float32)
+        group_baseline = group_rewards_tensor.mean()
+        group_advantages = group_rewards_tensor - group_baseline
+        
+        # Normalize group advantages if requested
+        if normalize:
+            group_std = group_rewards_tensor.std()
+            if group_std > 0:
+                group_advantages = group_advantages / group_std
+        
+        # Assign advantages to samples based on their group memberships
+        for sample_idx in range(num_generations_per_prompt):
+            if sample_group_memberships[sample_idx]:
+                # Sum advantages from all groups this sample belongs to
+                sample_advantage = sum(
+                    group_advantages[group_idx].item() 
+                    for group_idx in sample_group_memberships[sample_idx]
+                )
+                prompt_advantages[sample_idx] = sample_advantage
+        
+        # Store advantages for this prompt
+        start_idx = prompt_idx * num_generations_per_prompt
+        end_idx = start_idx + num_generations_per_prompt
+        advantages[start_idx:end_idx] = prompt_advantages
+        
+        group_rewards_all.extend(group_rewards)
+    
+    # Calculate metrics
+    metrics = {
+        "best_at_k_mean_group_reward": np.mean(group_rewards_all),
+        "best_at_k_std_group_reward": np.std(group_rewards_all),
+        "best_at_k_min_group_reward": np.min(group_rewards_all),
+        "best_at_k_max_group_reward": np.max(group_rewards_all),
+        "best_at_k_k": k,
+        "best_at_k_m": m,
+        "best_at_k_effective_m": effective_m,
+        "best_at_k_max_unique_groups": max_unique_groups,
+        "best_at_k_used_all_combinations": use_all_combinations,
+    }
+    
+    return advantages.unsqueeze(-1), metrics
+
+
 def apply_environment_post_processing(
     batch: BatchedDataDict[DatumSpec], 
     task_to_env: Dict[str, EnvironmentInterface],
@@ -240,6 +385,10 @@ class ParallelThinkingGRPOConfig(TypedDict):
     skip_stage1_env_post_processing: bool # Skip environment post-processing for stage 1
     skip_stage2_env_post_processing: bool # Skip environment post-processing for stage 2
     skip_val_env_post_processing: bool # Skip environment post-processing for validation
+    # Best@k training configuration for stage 1
+    use_best_at_k_for_stage1: bool  # Enable Best@k training for stage 1
+    best_at_k_k: int  # k value for Best@k (number of samples per group)
+    best_at_k_m: int  # m value for Best@k (number of bootstrap groups)
 
 
 class ParallelThinkingGRPOSaveState(TypedDict):
@@ -960,14 +1109,50 @@ def parallel_thinking_grpo_train(
                 # Check for potentially problematic configuration
                 expected_responses = master_config["pt_grpo"]["num_generations_per_prompt"] if master_config["pt_grpo"].get("check_baseline_correctness", True) else None
                 
-                stage1_baseline, stage1_std, stage1_metrics = calculate_baseline_and_std_per_prompt(
-                    stage1_prompt_input_ids,
-                    stage1_rewards,
-                    torch.ones_like(stage1_rewards),
-                    leave_one_out_baseline=master_config["pt_grpo"]["use_leave_one_out_baseline"],
-                    expected_responses_per_prompt=expected_responses,
-                )
-                stage1_advantages = (stage1_rewards - stage1_baseline).unsqueeze(-1)
+                # Use Best@k training for stage 1 if configured
+                if master_config["pt_grpo"].get("use_best_at_k_for_stage1", False):
+                    print("    Using Best@k bootstrap sampling for stage 1...")
+                    k = master_config["pt_grpo"]["best_at_k_k"]
+                    m = master_config["pt_grpo"]["best_at_k_m"]
+                    
+                    stage1_advantages, stage1_best_at_k_metrics = calculate_best_at_k_advantages_bootstrap(
+                        rewards=stage1_rewards,
+                        num_prompts=num_prompts,
+                        num_generations_per_prompt=master_config["pt_grpo"]["num_generations_per_prompt"],
+                        k=k,
+                        m=m,
+                        normalize=master_config["pt_grpo"]["normalize_rewards"],
+                    )
+                    
+                    # Create stage1_baseline and stage1_std for compatibility
+                    # not meaningful for best@k training
+                    stage1_baseline = torch.zeros_like(stage1_rewards)
+                    stage1_std = torch.ones_like(stage1_rewards)
+                    stage1_metrics = stage1_best_at_k_metrics
+                    
+                    print(f"    Best@k: k={k}, m={m}, mean_group_reward={stage1_best_at_k_metrics['best_at_k_mean_group_reward']:.4f}")
+                    print(f"    Max unique groups: C({master_config['pt_grpo']['num_generations_per_prompt']},{k})={stage1_best_at_k_metrics['best_at_k_max_unique_groups']}")
+                    if stage1_best_at_k_metrics['best_at_k_used_all_combinations']:
+                        print(f"    ✓ Used all {stage1_best_at_k_metrics['best_at_k_effective_m']} unique combinations")
+                    else:
+                        print(f"    • Sampled {stage1_best_at_k_metrics['best_at_k_effective_m']} groups")
+                else:
+                    # Original baseline calculation
+                    stage1_baseline, stage1_std, stage1_metrics = calculate_baseline_and_std_per_prompt(
+                        stage1_prompt_input_ids,
+                        stage1_rewards,
+                        torch.ones_like(stage1_rewards),
+                        leave_one_out_baseline=master_config["pt_grpo"]["use_leave_one_out_baseline"],
+                        expected_responses_per_prompt=expected_responses,
+                    )
+                    stage1_advantages = (stage1_rewards - stage1_baseline).unsqueeze(-1)
+                    
+                    # Normalize rewards if configured (only for non-Best@k)
+                    if master_config["pt_grpo"]["normalize_rewards"]:
+                        zero_std_mask = stage1_std > 0
+                        stage1_advantages[zero_std_mask] = (
+                            stage1_advantages[zero_std_mask] / stage1_std.unsqueeze(-1)[zero_std_mask]
+                        )
 
                 # Stage 2 advantages
                 print("  • Computing stage 2 advantages...")
@@ -982,11 +1167,12 @@ def parallel_thinking_grpo_train(
 
                 # Normalize rewards if configured
                 if master_config["pt_grpo"]["normalize_rewards"]:
-                    # Stage 1 normalization
-                    zero_std_mask = stage1_std > 0
-                    stage1_advantages[zero_std_mask] = (
-                        stage1_advantages[zero_std_mask] / stage1_std.unsqueeze(-1)[zero_std_mask]
-                    )
+                    # Stage 1 normalization - skip if using Best@k (already normalized)
+                    if not master_config["pt_grpo"].get("use_best_at_k_for_stage1", False):
+                        zero_std_mask = stage1_std > 0
+                        stage1_advantages[zero_std_mask] = (
+                            stage1_advantages[zero_std_mask] / stage1_std.unsqueeze(-1)[zero_std_mask]
+                        )
 
                     # Stage 2 normalization
                     zero_std_mask = stage2_std > 0
