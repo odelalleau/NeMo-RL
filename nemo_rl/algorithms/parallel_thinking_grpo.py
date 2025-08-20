@@ -389,6 +389,9 @@ class ParallelThinkingGRPOConfig(TypedDict):
     use_best_at_k_for_stage1: bool  # Enable Best@k training for stage 1
     best_at_k_k: int  # k value for Best@k (number of samples per group)
     best_at_k_m: int  # m value for Best@k (number of bootstrap groups)
+    # Binary reward configuration for stage 2
+    use_binary_reward_for_stage2: bool  # Enable binary reward transformation for stage 2
+    binary_reward_threshold_type: str  # Type of threshold: "best" (vs best stage1) or future options
 
 
 class ParallelThinkingGRPOSaveState(TypedDict):
@@ -1079,6 +1082,33 @@ def parallel_thinking_grpo_train(
             # Extract stage 2 rewards
             stage2_rewards = stage2_repeated_batch["total_reward"]
 
+            # Transform stage 2 rewards to binary if configured
+            stage2_rewards_original = stage2_rewards.clone()  # Keep original for metrics
+            binary_reward_rate = None
+            
+            if master_config["pt_grpo"].get("use_binary_reward_for_stage2", False):
+                print("  • Applying binary reward transformation for stage 2...")
+                
+                # Reshape rewards by prompt
+                stage1_rewards_by_prompt = stage1_rewards.view(num_prompts, num_generations)
+                stage2_rewards_by_prompt = stage2_rewards.view(num_prompts, num_generations)
+                
+                threshold_type = master_config["pt_grpo"].get("binary_reward_threshold_type", "best")
+                
+                if threshold_type == "best":
+                    # Get best stage 1 reward for each prompt
+                    best_stage1_per_prompt = stage1_rewards_by_prompt.max(dim=1, keepdim=True)[0]
+                    
+                    # Create binary rewards: 1 if stage2 >= best stage1, 0 otherwise
+                    stage2_binary_rewards = (stage2_rewards_by_prompt >= best_stage1_per_prompt).float()
+                    stage2_rewards = stage2_binary_rewards.view(-1)  # Flatten back
+                    
+                    # Log binary reward stats
+                    binary_reward_rate = stage2_binary_rewards.mean().item()
+                    print(f"    Binary reward rate: {binary_reward_rate:.2%} of stage 2 responses beat/match best stage 1")
+                else:
+                    raise ValueError(f"Unknown binary_reward_threshold_type: {threshold_type}")
+
             # Calculate stage2_better_than_stage1_avg_rate metric (vectorized, strict shape check)
             # Enforce that Stage 2 has the same number of prompts as Stage 1; otherwise raise an error.
             stage2_num_prompts = stage2_rewards.numel() // num_generations if stage2_rewards.numel() > 0 else 0
@@ -1090,7 +1120,7 @@ def parallel_thinking_grpo_train(
 
             # Group rewards by prompt
             stage1_rewards_by_prompt = stage1_rewards.view(num_prompts, num_generations)
-            stage2_rewards_by_prompt = stage2_rewards.view(num_prompts, num_generations)
+            stage2_rewards_by_prompt = stage2_rewards_original.view(num_prompts, num_generations)  # Use original rewards
 
             # Average stage1 rewards per prompt
             stage1_avg_rewards_per_prompt = stage1_rewards_by_prompt.mean(dim=1, keepdim=True)
@@ -1181,7 +1211,11 @@ def parallel_thinking_grpo_train(
                     )
 
                 # Combine all rewards and advantages for metrics
-                all_rewards = torch.cat([stage1_rewards, stage2_rewards])
+                # Use original rewards for stage 2 when binary rewards are enabled
+                if master_config["pt_grpo"].get("use_binary_reward_for_stage2", False):
+                    all_rewards = torch.cat([stage1_rewards, stage2_rewards_original])  # Use original for display
+                else:
+                    all_rewards = torch.cat([stage1_rewards, stage2_rewards])
                 all_advantages = torch.cat([stage1_advantages.flatten(), stage2_advantages.flatten()])
                 
                 # Calculate metrics
@@ -1198,9 +1232,9 @@ def parallel_thinking_grpo_train(
                     "stage1_reward_max": stage1_rewards.max(),
                     "stage1_baseline_mean": stage1_baseline.mean(),
                     "stage1_std_mean": stage1_std.mean(),
-                    "stage2_reward_min": stage2_rewards.min(),
-                    "stage2_reward_mean": stage2_rewards.mean(),
-                    "stage2_reward_max": stage2_rewards.max(),
+                    "stage2_reward_min": stage2_rewards_original.min(),
+                    "stage2_reward_mean": stage2_rewards_original.mean(),
+                    "stage2_reward_max": stage2_rewards_original.max(),
                     "stage2_baseline_mean": stage2_baseline.mean(),
                     "stage2_std_mean": stage2_std.mean(),
                     "combined_reward_min": all_rewards.min(),
@@ -1209,6 +1243,10 @@ def parallel_thinking_grpo_train(
                     "percent_zero_advantages": (all_advantages == 0).float().mean(),
                     "stage2_better_than_stage1_avg_rate": stage2_better_than_stage1_avg_rate,
                 })
+                
+                # Add binary reward metrics if enabled
+                if master_config["pt_grpo"].get("use_binary_reward_for_stage2", False):
+                    rollout_metrics["stage2_binary_reward_mean"] = stage2_rewards.mean()  # Binary reward rate
 
             # ============== Prepare Training Data ==============
             print("\n▶ Preparing training data...")
@@ -1352,8 +1390,10 @@ def parallel_thinking_grpo_train(
         print("\n📊 Training Results:")
         print(f"  • Combined Avg Reward: {all_rewards.mean():.4f}")
         print(f"  • Stage 1 Avg Reward: {stage1_rewards.mean():.4f}")
-        print(f"  • Stage 2 Avg Reward: {stage2_rewards.mean():.4f}")
+        print(f"  • Stage 2 Avg Reward: {stage2_rewards_original.mean():.4f}")
         print(f"  • Stage 2 Better Than Stage 1 Avg Rate: {stage2_better_than_stage1_avg_rate:.2%}")
+        if binary_reward_rate is not None:
+            print(f"  • Binary Reward Rate: {binary_reward_rate:.2%}")
         print(f"  • Stage 1 Mean Gen Length: {rollout_metrics.get('stage1_mean_gen_tokens_per_sample', 0):.1f}")
         print(f"  • Stage 2 Mean Gen Length: {rollout_metrics.get('stage2_mean_gen_tokens_per_sample', 0):.1f}")
 
@@ -1369,7 +1409,7 @@ def parallel_thinking_grpo_train(
             stage1_repeated_batch=stage1_repeated_batch,
             stage1_rewards=stage1_rewards,
             stage2_repeated_batch=stage2_repeated_batch,
-            stage2_rewards=stage2_rewards,
+            stage2_rewards=stage2_rewards_original,  # Always use original rewards for logging
             num_generations_per_prompt=master_config["pt_grpo"]["num_generations_per_prompt"],
         )
         log_data.update(pt_data)

@@ -27,6 +27,18 @@ pt_grpo:
   best_at_k_k: 4  # Number of samples per bootstrap group (should be <= num_generations_per_prompt)
   best_at_k_m: 100  # Number of bootstrap groups (will use C(n,k) if smaller)
   
+  # Binary reward configuration for Stage 2
+  # This makes stage 2 receive binary rewards based on whether it beats the best stage 1 response
+  use_binary_reward_for_stage2: false  # Set to true to enable binary reward transformation
+  binary_reward_threshold_type: "best"  # Type of threshold: "best" (reward=1 if stage2 >= best stage1, 0 otherwise)
+  
+  # When to use binary rewards:
+  # - Enable this if you find that the model is learning to make bad responses slightly better
+  #   rather than identifying and amplifying the best insights from stage 1
+  # - Binary rewards force the model to focus on producing aggregations that are at least as good
+  #   as the best individual attempt, preventing "regression to the mean" behavior
+  # - Trade-off: You lose granularity about how much better the aggregation is
+  
   # Note: Generation length is controlled by policy.generation.max_new_tokens
   # Both stages use the same max_new_tokens value from the generation config
 
