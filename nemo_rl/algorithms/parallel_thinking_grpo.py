@@ -1232,15 +1232,19 @@ def parallel_thinking_grpo_train(
                     "stage1_reward_max": stage1_rewards.max(),
                     "stage1_baseline_mean": stage1_baseline.mean(),
                     "stage1_std_mean": stage1_std.mean(),
+                    "stage1_perfect_prediction_rate": (stage1_rewards == 0).float().mean(),  # Percentage of perfect predictions
+                    "stage1_percent_zero_advantages": (stage1_advantages == 0).float().mean(),  # Zero advantages for stage 1
                     "stage2_reward_min": stage2_rewards_original.min(),
                     "stage2_reward_mean": stage2_rewards_original.mean(),
                     "stage2_reward_max": stage2_rewards_original.max(),
                     "stage2_baseline_mean": stage2_baseline.mean(),
                     "stage2_std_mean": stage2_std.mean(),
+                    "stage2_perfect_prediction_rate": (stage2_rewards_original == 0).float().mean(),  # Percentage of perfect predictions
+                    "stage2_percent_zero_advantages": (stage2_advantages == 0).float().mean(),  # Zero advantages for stage 2
                     "combined_reward_min": all_rewards.min(),
                     "combined_reward_mean": all_rewards.mean(),
                     "combined_reward_max": all_rewards.max(),
-                    "percent_zero_advantages": (all_advantages == 0).float().mean(),
+                    "percent_zero_advantages": (all_advantages == 0).float().mean(),  # Keep combined metric for backward compatibility
                     "stage2_better_than_stage1_avg_rate": stage2_better_than_stage1_avg_rate,
                 })
                 
