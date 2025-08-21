@@ -1127,7 +1127,7 @@ def parallel_thinking_grpo_train(
 
             # Compare each stage2 response to its prompt's stage1 average and take overall mean
             stage2_better_than_stage1_avg_rate = (
-                (stage2_rewards_by_prompt > stage1_avg_rewards_per_prompt).float().mean().item()
+                (stage2_rewards_by_prompt >= stage1_avg_rewards_per_prompt).float().mean().item()
             )
 
             # ============== Calculate Rewards & Advantages ==============
