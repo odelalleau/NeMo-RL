@@ -15,7 +15,7 @@ import os
 import random
 import time
 import math
-from collections import defaultdict
+from collections import defaultdict, Counter
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import timedelta
@@ -278,6 +278,57 @@ def calculate_best_at_k_advantages_bootstrap(
     }
     
     return advantages.unsqueeze(-1), metrics
+
+
+def detect_stage1_majority_clusters(
+    stage1_rewards: torch.Tensor,
+    num_prompts: int,
+    num_generations_per_prompt: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Detect majority clusters in Stage 1 responses based on reward values.
+    
+    A majority cluster exists when one reward value has strictly more responses
+    than any other reward value (no ties).
+    
+    Args:
+        stage1_rewards: Tensor of shape (num_prompts * num_generations_per_prompt,)
+        num_prompts: Number of original prompts
+        num_generations_per_prompt: Number of generations per prompt
+        
+    Returns:
+        Tuple of:
+        - has_majority: Boolean tensor of shape (num_prompts,) indicating which prompts have majority
+        - majority_reward: Tensor of shape (num_prompts,) with majority reward value (0 if no majority)
+        - majority_size: Tensor of shape (num_prompts,) with size of majority cluster (0 if no majority)
+    """
+    # Reshape to (num_prompts, num_generations_per_prompt)
+    rewards_by_prompt = stage1_rewards.view(num_prompts, num_generations_per_prompt)
+    
+    has_majority = torch.zeros(num_prompts, dtype=torch.bool)
+    majority_reward = torch.zeros(num_prompts, dtype=torch.float32)
+    majority_size = torch.zeros(num_prompts, dtype=torch.long)
+    
+    for prompt_idx in range(num_prompts):
+        prompt_rewards = rewards_by_prompt[prompt_idx].tolist()
+        
+        # Count occurrences of each reward value
+        reward_counts = Counter(prompt_rewards)
+        
+        # Sort by count (descending)
+        sorted_counts = sorted(reward_counts.items(), key=lambda x: x[1], reverse=True)
+        
+        # Check if there's a strict majority (no ties at the top)
+        if len(sorted_counts) >= 2 and sorted_counts[0][1] > sorted_counts[1][1]:
+            has_majority[prompt_idx] = True
+            majority_reward[prompt_idx] = sorted_counts[0][0]
+            majority_size[prompt_idx] = sorted_counts[0][1]
+        elif len(sorted_counts) == 1:
+            # All responses have the same reward - this is a majority
+            has_majority[prompt_idx] = True
+            majority_reward[prompt_idx] = sorted_counts[0][0]
+            majority_size[prompt_idx] = sorted_counts[0][1]
+    
+    return has_majority, majority_reward, majority_size
 
 
 def apply_environment_post_processing(
@@ -1130,6 +1181,47 @@ def parallel_thinking_grpo_train(
                 (stage2_rewards_by_prompt >= stage1_avg_rewards_per_prompt).float().mean().item()
             )
 
+            # ============== Calculate Majority Cluster Metrics ==============
+            print("\n▶ Detecting Stage 1 majority clusters...")
+            has_majority, majority_reward, majority_size = detect_stage1_majority_clusters(
+                stage1_rewards, num_prompts, num_generations
+            )
+            
+            # Calculate metrics
+            majority_rate = has_majority.float().mean().item()
+            print(f"  • {majority_rate:.2%} of prompts have a majority cluster in Stage 1")
+            
+            # For prompts with majority, check Stage 2 performance
+            if has_majority.any():
+                # Get Stage 2 rewards for prompts with majority (take first generation per prompt as representative)
+                stage2_first_gen_rewards = stage2_rewards_original.view(num_prompts, num_generations)[:, 0]
+                
+                # Stage 2 same as majority
+                stage2_same_as_majority = torch.zeros(num_prompts, dtype=torch.bool)
+                stage2_same_as_majority[has_majority] = (
+                    stage2_first_gen_rewards[has_majority] == majority_reward[has_majority]
+                )
+                stage2_same_as_majority_rate = stage2_same_as_majority[has_majority].float().mean().item()
+                
+                # Stage 2 better than majority
+                stage2_better_than_majority = torch.zeros(num_prompts, dtype=torch.bool)
+                stage2_better_than_majority[has_majority] = (
+                    stage2_first_gen_rewards[has_majority] > majority_reward[has_majority]
+                )
+                stage2_better_than_majority_rate = stage2_better_than_majority[has_majority].float().mean().item()
+                
+                print(f"  • Among prompts with majority:")
+                print(f"    - {stage2_same_as_majority_rate:.2%} of Stage 2 responses match majority reward")
+                print(f"    - {stage2_better_than_majority_rate:.2%} of Stage 2 responses beat majority reward")
+                
+                # Average majority cluster size for prompts with majority
+                avg_majority_size = majority_size[has_majority].float().mean().item()
+                print(f"    - Average majority cluster size: {avg_majority_size:.1f}/{num_generations}")
+            else:
+                stage2_same_as_majority_rate = 0.0
+                stage2_better_than_majority_rate = 0.0
+                avg_majority_size = 0.0
+
             # ============== Calculate Rewards & Advantages ==============
             print("\n▶ Processing rewards and advantages...")
             with timer.time("reward_calculation"):
@@ -1246,6 +1338,11 @@ def parallel_thinking_grpo_train(
                     "combined_reward_max": all_rewards.max(),
                     "percent_zero_advantages": (all_advantages == 0).float().mean(),  # Keep combined metric for backward compatibility
                     "stage2_better_than_stage1_avg_rate": stage2_better_than_stage1_avg_rate,
+                    # Majority cluster metrics
+                    "stage1_majority_rate": majority_rate,
+                    "stage2_same_as_majority_rate": stage2_same_as_majority_rate,
+                    "stage2_better_than_majority_rate": stage2_better_than_majority_rate,
+                    "stage1_avg_majority_size": avg_majority_size,
                 })
                 
                 # Add binary reward metrics if enabled
