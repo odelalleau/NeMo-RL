@@ -76,9 +76,9 @@ class VanillaGenRMWorker:
                 json_str = json_match.group(0)
                 parsed = json.loads(json_str)
                 
-                score_1 = parsed.get("score_1")
-                score_2 = parsed.get("score_2")
-                ranking = parsed.get("ranking")
+                score_1 = float(parsed.get("score_1"))
+                score_2 = float(parsed.get("score_2"))
+                ranking = float(parsed.get("ranking"))
                 
                 # Check if any required scores are None - if so, mark as parsing failure
                 parsing_success = (score_1 is not None and 
