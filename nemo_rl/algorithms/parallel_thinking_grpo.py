@@ -443,6 +443,9 @@ class ParallelThinkingGRPOConfig(TypedDict):
     # Binary reward configuration for stage 2
     use_binary_reward_for_stage2: bool  # Enable binary reward transformation for stage 2
     binary_reward_threshold_type: str  # Type of threshold: "best" (vs best stage1) or future options
+    # Cluster handling - proportional bonus for overcoming Stage 1 clusters
+    use_stage2_cluster_bonus: bool  # Enable proportional bonus for overcoming Stage 1 clusters (default: False)
+    stage2_cluster_bonus_scale: float  # Scale factor for proportional bonus based on cluster size (default: 1.0)
 
 
 class ParallelThinkingGRPOSaveState(TypedDict):
@@ -1221,6 +1224,55 @@ def parallel_thinking_grpo_train(
                 stage2_same_as_majority_rate = 0.0
                 stage2_better_than_majority_rate = 0.0
                 avg_majority_size = 0.0
+            
+            # ============== Add Bonus to Stage 2 Rewards for Overcoming Majority Clusters ==============
+            use_stage2_cluster_bonus = master_config["pt_grpo"].get("use_stage2_cluster_bonus", False)
+            stage2_cluster_bonus_scale = master_config["pt_grpo"].get("stage2_cluster_bonus_scale", 1.0)
+            
+            if use_stage2_cluster_bonus and has_majority.any() and stage2_cluster_bonus_scale > 0:
+                print(f"\n▶ Adding proportional reward bonus for Stage 2 responses that overcome Stage 1 clusters...")
+                
+                # For each stage 2 response, check if it beats the corresponding stage 1 majority
+                stage2_rewards_by_prompt = stage2_rewards_original.view(num_prompts, num_generations)
+                
+                bonus_count = 0
+                total_bonus_added = 0.0
+                bonus_details = []
+                
+                for prompt_idx in range(num_prompts):
+                    if has_majority[prompt_idx]:
+                        # This prompt has a majority cluster in Stage 1
+                        stage1_majority_reward = majority_reward[prompt_idx]
+                        cluster_fraction = majority_size[prompt_idx].float() / num_generations
+                        
+                        # Calculate bonus proportional to cluster size
+                        # For example, if 6/8 responses are the same, cluster_fraction = 0.75
+                        # The bonus would be 0.75 * stage2_cluster_bonus_scale
+                        proportional_bonus = cluster_fraction * stage2_cluster_bonus_scale
+                        
+                        # Check each Stage 2 generation for this prompt
+                        for gen_idx in range(num_generations):
+                            global_idx = prompt_idx * num_generations + gen_idx
+                            stage2_reward = stage2_rewards_by_prompt[prompt_idx, gen_idx]
+                            
+                            # If this Stage 2 response beats the Stage 1 majority, add proportional bonus
+                            if stage2_reward > stage1_majority_reward:
+                                # Add bonus to the actual training reward (not the original)
+                                stage2_rewards[global_idx] = stage2_rewards[global_idx] + proportional_bonus
+                                bonus_count += 1
+                                total_bonus_added += proportional_bonus
+                                
+                                # Track bonus details for logging
+                                if len(bonus_details) < 5:  # Keep first 5 for example
+                                    bonus_details.append(f"{majority_size[prompt_idx]}/{num_generations} -> +{proportional_bonus:.3f}")
+                
+                print(f"  • Added proportional bonuses to {bonus_count} Stage 2 responses")
+                print(f"    Total bonus added: {total_bonus_added:.2f} (scale factor: {stage2_cluster_bonus_scale})")
+                if bonus_details:
+                    print(f"    Examples: {', '.join(bonus_details)}")
+                
+                # Update repeated batch with modified rewards
+                stage2_repeated_batch["total_reward"] = stage2_rewards
 
             # ============== Calculate Rewards & Advantages ==============
             print("\n▶ Processing rewards and advantages...")
@@ -1348,6 +1400,12 @@ def parallel_thinking_grpo_train(
                 # Add binary reward metrics if enabled
                 if master_config["pt_grpo"].get("use_binary_reward_for_stage2", False):
                     rollout_metrics["stage2_binary_reward_mean"] = stage2_rewards.mean()  # Binary reward rate
+                
+                # Add cluster overcome bonus metrics if enabled
+                if use_stage2_cluster_bonus and 'bonus_count' in locals():
+                    rollout_metrics["stage2_cluster_bonus_count"] = bonus_count
+                    rollout_metrics["stage2_cluster_bonus_rate"] = bonus_count / len(stage2_rewards) if len(stage2_rewards) > 0 else 0.0
+                    rollout_metrics["stage2_cluster_bonus_total"] = total_bonus_added
 
             # ============== Prepare Training Data ==============
             print("\n▶ Preparing training data...")

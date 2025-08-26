@@ -31,7 +31,13 @@ pt_grpo:
   # This makes stage 2 receive binary rewards based on whether it beats the best stage 1 response
   use_binary_reward_for_stage2: false  # Set to true to enable binary reward transformation
   binary_reward_threshold_type: "best"  # Type of threshold: "best" (reward=1 if stage2 >= best stage1, 0 otherwise)
-  
+    
+  # Cluster handling - proportional bonus for overcoming Stage 1 clusters
+  use_stage2_cluster_bonus: false  # Enable proportional bonus for overcoming Stage 1 clusters
+  stage2_cluster_bonus_scale: 1.0  # Scale factor for proportional bonus based on cluster size (default: 1.0)
+  # Example: If 6/8 Stage 1 responses are identical and Stage 2 beats them, bonus = (6/8) * 1.0 = 0.75
+  # Larger clusters give bigger bonuses when overcome, incentivizing Stage 2 to break out of local optima
+
   # When to use binary rewards:
   # - Enable this if you find that the model is learning to make bad responses slightly better
   #   rather than identifying and amplifying the best insights from stage 1
