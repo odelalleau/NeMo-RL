@@ -1,0 +1,272 @@
+# Plan GRPO Algorithm Configuration
+plan_grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16  # Total generations (num_plans_per_prompt * num_judgments_per_plan)
+  num_plans_per_prompt: 4  # Number of evaluation plans to generate
+  num_judgments_per_plan: 4  # Number of judgments per plan
+  max_rollout_turns: 1 # for multi-turn rollouts. Vanilla GenRM has 1 turn
+
+  num_epochs: 1
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 10
+  val_at_start: false
+  max_val_samples: 256
+  num_val_repeats: 1
+
+  val_batch_size: 256 # unused
+  time_limit: "00:03:30:00"
+  
+  # Skip environment post-processing for debugging
+  skip_stage1_env_post_processing: true  # Skip plan generation environment processing if true
+  skip_stage2_env_post_processing: true  # Skip judgment evaluation if true
+  
+  # JSON parsing penalty
+  json_parse_failure_penalty: -50.0  # Penalty reward for plans that fail to parse as valid JSON
+  
+  # Prompt templates for plan GRPO
+  plan_prompt_template: |-
+    You are an expert evaluation planner. Given a conversation that ends with a user question, create a comprehensive evaluation plan for judging potential responses.
+    
+    ## Conversation Context:
+    {original_question}
+    
+    ## Your Task:
+    Create a detailed, actionable plan that a judge can follow to evaluate responses to the user's question. The plan should be written in second person (using "you" to address the judge).
+    
+    ## Guidelines for Your Plan:
+    1. Be specific and systematic - break down the evaluation into clear steps
+    2. Consider multiple dimensions: accuracy, factual correctness, helpfulness, relevance, completeness, clarity, safety, etc.
+    3. Include instructions for the judge, including but not limited to:
+       - Generate its own response for comparison
+       - Create a checklist of key criteria
+       - Identify potential errors or weaknesses
+       - Compare responses objectively
+    4. Focus on the specific context and requirements of the user's question
+    
+    ## Important Notes:
+    - Do NOT include scoring guidelines (these will be provided separately)
+    - Make the plan actionable and easy to follow
+    - Ensure the plan is tailored to the specific question asked
+    
+    ## Output Format:
+    Respond with ONLY a JSON object in the exact format below. Do not include any other text, explanation, or markdown formatting:
+    {{"plan": "Step 1: First, you should...\nStep 2: Next, you should...\nStep 3: Then, you should...", "reason": "This evaluation approach is effective because..."}}
+    
+  judgment_prompt_template: |
+    Using the following evaluation plan:
+    
+    {plan}
+    
+    Please judge these two responses to the question: "{question}"
+    
+    Response 1: {response_1}
+    
+    Response 2: {response_2}
+    
+    Based on the evaluation plan, provide your judgment with the following scores:
+    - score_1: Individual helpfulness score for Response 1 (1-10)
+    - score_2: Individual helpfulness score for Response 2 (1-10)  
+    - ranking: Comparative ranking (1-6 scale where 1=Response 1 much better, 6=Response 2 much better)
+    
+    Format your response as JSON:
+    ```json
+    {
+      "response_1_analysis": "Brief analysis of Response 1",
+      "response_2_analysis": "Brief analysis of Response 2",
+      "score_1": <number>,
+      "score_2": <number>,
+      "ranking": <number>
+    }
+    ```
+
+loss_fn:
+  reference_policy_kl_penalty: 0.01
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: null
+  # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
+  use_on_policy_kl_approximation: false
+  use_importance_sampling_correction: false
+  token_level_loss: true
+  use_generation_logprobs_in_ppo_baseline: false
+  use_kl_fix: false
+  use_stable_loss: false
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/plan_grpo"
+  metric_name: "val_reward"
+  higher_is_better: true
+  keep_top_k: 3
+  save_period: 10
+
+policy:
+  # Qwen/Qwen2.5-1.5B has tied weights which are only supported with dtensor policy with tp size 1 (https://github.com/NVIDIA/NeMo-RL/issues/227)
+  model_name: "Qwen/Qwen2.5-1.5B"
+  tokenizer:
+    name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
+  train_global_batch_size: 512
+  train_micro_batch_size: 4
+  num_global_batch_repeats: 1
+  generation_batch_size: 32 # Only used when generating using HF backend
+  logprob_batch_size: 4
+  max_total_sequence_length: 512
+  precision: "bfloat16"
+  fsdp_offload_enabled: false
+  activation_checkpointing_enabled: false
+  refit_buffer_size_gb: 4 # used for refitting inference engine, the unit is GB
+
+  dtensor_cfg:
+    enabled: true
+    cpu_offload: False
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+
+  # dynamic_batching improves performance by ensuring logprob and training microbatches
+  # have a sufficent number of tokens to maximize GPU utilization. Specifically, variable length
+  # responses are sorted by sequence length and bucketed into microbatches with a total
+  # amount of tokens is approximately close to 'train_mb_tokens' and 'logprob_mb_tokens' for the
+  # training and logprob stages respectively.
+  dynamic_batching:
+    enabled: True
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  # makes the training sequence length divisible by the tensor parallel size
+  # this is useful for sequence parallel training
+  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  max_grad_norm: 1.0
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 2.0e-6
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1e-8
+      # when using Dtensor, we need to set foreach
+      # and fused to False
+      foreach: False
+      fused: False
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 50
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [50]
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      precision: ${policy.precision}
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+
+data:
+  train:
+    shuffle: False
+    seed: 420 # unused if shuffle is False
+    jsonl_path: ...
+
+    # checks if it's too long on init
+    filter_long_samples: false
+    drop_last: True
+
+  val:
+    shuffle: False
+    seed: 420 # unused if shuffle is False
+    jsonl_path: ...
+    drop_last: False
+
+    # checks if it's too long on init
+    filter_long_samples: false
+
+  max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
+
+env:
+  math:
+    enable: false
+    num_workers: 8
+  code:
+    enable: false
+    num_workers: 8
+    timeout: 10
+    reasoning_split_word: "</think>" # The word to split the response into reasoning and answer
+  llm_judge_async: # Configuration for the LlmJudgeAsyncEnvironment
+    enable: false
+    num_workers: 2 # Number of parallel judge workers
+    model_name: "Qwen/Qwen2.5-32B-Instruct" # Judge model
+    tensor_parallel_size: 4 # TP size for the judge model
+    gpu_memory_utilization: 0.85 # For judge model
+    max_model_len: 16384 # Max sequence length for the judge model
+    temperature: 0.0 # Judge temperature (usually lower for more deterministic judging)
+    max_tokens: 512  # Max tokens for the judge's evaluation
+    reasoning_split_word: "</think>" # The word to split the response into reasoning and answer
+    stop: null # Stop strings for the judge's evaluation
+    max_concurrency: 16 # Maximum concurrent step calls for the environment actor (default: 16)
+  genrm_pairwise: # Configuration for the GenRM pairwise comparison environment
+    enable: false
+    num_workers: 2 # Number of parallel GenRM workers
+    model_name: "nvidia/Llama-3_3-Nemotron-Super-49B-GenRM" # GenRM model for pairwise comparison
+    tensor_parallel_size: 4 # TP size for the GenRM model (requires substantial GPU memory)
+    gpu_memory_utilization: 0.95 # GPU memory utilization for GenRM model
+    max_model_len: 40000 # Max sequence length for GenRM model
+    num_generations_per_prompt: ${plan_grpo.num_plans_per_prompt} # The exected number of responses to generate per prompt for pairwise comparison, for validation purpose
+    temperature: 0.0 # GenRM temperature (usually 0 for deterministic evaluation)
+    max_tokens: 32768 # Max tokens for GenRM's comparison output
+    stop: null # Stop strings for GenRM evaluation
+    reasoning_split_word: "</think>" # The word to split the response into reasoning and answer
+    max_concurrency: 16 # Maximum concurrent step calls for the environment actor
+    # Reward aggregation configuration
+    aggregator_method: "simple_tiebreaker" # Options: "weighted_win_loss", "simple_tiebreaker", "individual_scores"
+    # aggregator_config: # Additional config for the aggregator
+    #   score_mapping: # Mapping from ranking scores (1-6) to weighted points for weighted_win_loss
+    #     1: 1.0    # Much better
+    #     2: 0.8   # Better
+    #     3: 0.6    # Slightly better
+    #     4: 0.4    # Slightly worse
+    #     5: 0.2   # Worse
+    #     6: 0.0    # Much worse
+  vanilla_genrm: # Configuration for the Vanilla GenRM training environment
+    enable: true
+    num_workers: 16 # Number of parallel evaluation workers
+    score_weight: 1.0 # Weight for individual response scores (score_1, score_2)
+    ranking_weight: 2.0 # Weight for ranking accuracy
+    reasoning_split_word: "</think>" # Split word to separate reasoning from final output
+  ifeval:
+    num_workers: 8
+    enable: false
+
+logger:
+  log_dir: "logs"  # Base directory for all logs
+  num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
+  wandb_enabled: false
+  tensorboard_enabled: false
+  monitor_gpus: false  # If true, will monitor GPU usage and log to wandb and/or tensorboard
+  wandb:
+    project: "plan-grpo-dev"
+    name: "plan-grpo-dev-logger"
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
+    flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
