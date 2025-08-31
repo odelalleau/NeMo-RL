@@ -71,6 +71,12 @@ from nemo_rl.utils.timer import Timer
 # ===============================================================================
 # Helper Functions  
 # ===============================================================================
+
+# Configuration example for baseline plan:
+# "plan_grpo": {
+#     "use_baseline_plan": true,
+#     "baseline_plan_template": "Carefully evaluate both responses by:\n1. Checking factual accuracy\n2. Assessing completeness\n3. Evaluating clarity\n4. Comparing helpfulness\nProvide detailed reasoning."
+# }
 def extract_plan_grpo_log_data(
     batch: BatchedDataDict[DatumSpec],
     stage1_repeated_batch: BatchedDataDict[DatumSpec],
@@ -864,6 +870,7 @@ def plan_grpo_train(
             # Extract stage 1 plans
             num_prompts = len(batch["message_log"])
             num_plans = master_config["plan_grpo"]["num_plans_per_prompt"]
+            use_baseline_plan = master_config["plan_grpo"].get("use_baseline_plan", False)
             
             # Get reasoning split word from any enabled environment
             reasoning_split_word = get_reasoning_split_word(master_config["env"])
@@ -915,10 +922,20 @@ def plan_grpo_train(
             # ============== Stage 2: Judgments using Plans ==============
             print("\n▶ Stage 2: Judgments using Plans...")
             with timer.time("stage2_preparation"):
+                # If using baseline plan, add it to the plans for stage 2
+                stage2_plans = stage1_plans
+                if use_baseline_plan:
+                    baseline_plan = master_config["plan_grpo"].get(
+                        "baseline_plan_template",
+                        "Carefully evaluate both responses by checking accuracy, completeness, and helpfulness. Compare them fairly and provide detailed reasoning."
+                    )
+                    # Create a copy and add baseline plan to each prompt's plans
+                    stage2_plans = [plans + [baseline_plan] for plans in stage1_plans]
+                
                 # Create judgment prompts using the plans
                 judgment_batch = create_judgment_prompts(
                     batch,
-                    stage1_plans,
+                    stage2_plans,
                     master_config["plan_grpo"]["judgment_prompt_template"],
                     tokenizer,
                 )
@@ -968,49 +985,103 @@ def plan_grpo_train(
             print("\n▶ Calculating plan rewards from judgment averages...")
             with timer.time("reward_calculation"):
                 # Aggregate judgment rewards to get plan rewards
+                # Note: num_plans_to_aggregate includes baseline plan if enabled
+                num_plans_to_aggregate = master_config["plan_grpo"]["num_plans_per_prompt"]
+                if use_baseline_plan:
+                    num_plans_to_aggregate += 1
+                    
                 stage1_rewards = aggregate_judgment_rewards_to_plans(
                     stage1_rewards=None,  # Not used, will be replaced
                     stage2_rewards=stage2_rewards,
                     num_prompts=num_prompts,
-                    num_plans_per_prompt=master_config["plan_grpo"]["num_plans_per_prompt"],
+                    num_plans_per_prompt=num_plans_to_aggregate,
                     num_judgments_per_plan=master_config["plan_grpo"]["num_judgments_per_plan"],
                 )
                 
-                # Apply penalty for plans that failed JSON parsing
-                json_parse_failures_tensor = torch.tensor(json_parse_failures, dtype=torch.bool)
-                penalty_reward = master_config["plan_grpo"].get("json_parse_failure_penalty", -50.0)
-                stage1_rewards[json_parse_failures_tensor] = penalty_reward
+                # If using baseline plan, we need to handle the fact that stage1 only has 8 plans
+                # but stage2 has 9 plans (8 generated + 1 baseline)
+                if use_baseline_plan:
+                    # Extract rewards for generated plans only (first 8)
+                    stage1_generated_plan_rewards = stage1_rewards.view(num_prompts, num_plans_to_aggregate)[:, :num_plans].reshape(-1)
+                    
+                    # Apply penalty for plans that failed JSON parsing (only for generated plans)
+                    json_parse_failures_generated = json_parse_failures[:len(stage1_generated_plan_rewards)]
+                    json_parse_failures_tensor = torch.tensor(json_parse_failures_generated, dtype=torch.bool)
+                    penalty_reward = master_config["plan_grpo"].get("json_parse_failure_penalty", -50.0)
+                    stage1_generated_plan_rewards[json_parse_failures_tensor] = penalty_reward
+                    
+                    # Update stage1 batch with rewards (only for generated plans)
+                    stage1_repeated_batch["total_reward"] = stage1_generated_plan_rewards
+                    
+                    # Keep full rewards including baseline for later use
+                    stage1_all_plan_rewards = stage1_rewards
+                else:
+                    # Apply penalty for plans that failed JSON parsing
+                    json_parse_failures_tensor = torch.tensor(json_parse_failures, dtype=torch.bool)
+                    penalty_reward = master_config["plan_grpo"].get("json_parse_failure_penalty", -50.0)
+                    stage1_rewards[json_parse_failures_tensor] = penalty_reward
+                    
+                    # Update stage1 batch with calculated rewards
+                    stage1_repeated_batch["total_reward"] = stage1_rewards
+                    stage1_all_plan_rewards = stage1_rewards
+                    stage1_generated_plan_rewards = stage1_rewards
                 
                 # Log statistics about JSON parsing failures
                 num_failures = json_parse_failures_tensor.sum().item()
                 if num_failures > 0:
-                    print(f"  ⚠️ Applied {penalty_reward} penalty to {num_failures}/{len(json_parse_failures)} plans that failed JSON parsing")
-                
-                # Update stage1 batch with calculated rewards
-                stage1_repeated_batch["total_reward"] = stage1_rewards
+                    print(f"  ⚠️ Applied {penalty_reward} penalty to {num_failures}/{len(json_parse_failures_tensor)} plans that failed JSON parsing")
                 
                 # Calculate advantages for plans
                 print("  • Computing plan advantages...")
+                
+                # Extract baseline plan rewards if using baseline plan
+                baseline_plan_rewards = None
+                if use_baseline_plan:
+                    # Baseline plan is the last plan for each prompt in the full rewards
+                    baseline_indices = [(i+1) * num_plans_to_aggregate - 1 for i in range(num_prompts)]
+                    baseline_plan_rewards = stage1_all_plan_rewards[baseline_indices]
+                    
+                    # For GRPO baseline calculation, use only the generated plans
+                    stage1_rewards_for_grpo = stage1_generated_plan_rewards
+                    stage1_input_ids_for_grpo = stage1_input_ids
+                else:
+                    stage1_rewards_for_grpo = stage1_repeated_batch["total_reward"]
+                    stage1_input_ids_for_grpo = stage1_input_ids
                 
                 # Check for potentially problematic configuration
                 expected_responses = master_config["plan_grpo"]["num_plans_per_prompt"] if master_config["plan_grpo"].get("check_baseline_correctness", True) else None
                 
                 # Get prompts for baseline calculation (use stage1 input ids)
-                stage1_baseline, stage1_std, stage1_more_metrics = calculate_baseline_and_std_per_prompt(
-                    prompts=stage1_input_ids,
-                    rewards=stage1_rewards,
-                    valid_mask=torch.ones_like(stage1_rewards),
+                stage1_grpo_baseline, stage1_grpo_std, stage1_grpo_metrics = calculate_baseline_and_std_per_prompt(
+                    prompts=stage1_input_ids_for_grpo,
+                    rewards=stage1_rewards_for_grpo,
+                    valid_mask=torch.ones_like(stage1_rewards_for_grpo),
                     leave_one_out_baseline=master_config["plan_grpo"]["use_leave_one_out_baseline"],
                     expected_responses_per_prompt=expected_responses,
                 )
-                stage1_rollout_metrics.update(stage1_more_metrics)
-                stage1_advantages = (stage1_rewards - stage1_baseline).unsqueeze(-1)
+                stage1_rollout_metrics.update(stage1_grpo_metrics)
+                
+                # Apply max with baseline plan rewards if enabled
+                if use_baseline_plan:
+                    # Apply max operation: baseline = max(GRPO_baseline, baseline_plan_reward)
+                    baseline_plan_rewards_expanded = baseline_plan_rewards.repeat_interleave(num_plans)
+                    stage1_final_baseline = torch.maximum(stage1_grpo_baseline, baseline_plan_rewards_expanded)
+                    
+                    # Log baseline plan effectiveness
+                    baseline_improvement = (baseline_plan_rewards_expanded > stage1_grpo_baseline).float().mean()
+                    stage1_rollout_metrics["baseline_plan_improvement_ratio"] = float(baseline_improvement)
+                    stage1_rollout_metrics["baseline_plan_reward_mean"] = float(baseline_plan_rewards.mean())
+                else:
+                    stage1_final_baseline = stage1_grpo_baseline
+                
+                # Calculate advantages only for generated plans
+                stage1_advantages = (stage1_generated_plan_rewards - stage1_final_baseline).unsqueeze(-1)
                 
                 if master_config["plan_grpo"]["normalize_rewards"]:
                     # Don't sharpen the ones with no variation
-                    zero_std_mask = stage1_std > 0
+                    zero_std_mask = stage1_grpo_std > 0
                     stage1_advantages[zero_std_mask] = (
-                        stage1_advantages[zero_std_mask] / stage1_std.unsqueeze(-1)[zero_std_mask]
+                        stage1_advantages[zero_std_mask] / stage1_grpo_std.unsqueeze(-1)[zero_std_mask]
                     )
                 
                 # Calculate advantages for judgments
@@ -1040,6 +1111,27 @@ def plan_grpo_train(
             # ============== Prepare Training Data ==============
             print("\n▶ Preparing training data...")
             with timer.time("train_data_preparation"):
+                # Filter out baseline plan judgments from stage2 if using baseline plan
+                if use_baseline_plan:
+                    # Calculate which stage2 samples correspond to baseline plans
+                    stage2_baseline_indices = []
+                    for i in range(num_prompts):
+                        # Baseline plan is the last plan for each prompt
+                        baseline_plan_idx = i * num_plans_to_aggregate + num_plans
+                        start_idx = baseline_plan_idx * master_config["plan_grpo"]["num_judgments_per_plan"]
+                        end_idx = start_idx + master_config["plan_grpo"]["num_judgments_per_plan"]
+                        stage2_baseline_indices.extend(range(start_idx, end_idx))
+                    
+                    stage2_mask = torch.ones(len(stage2_repeated_batch["message_log"]), dtype=torch.bool)
+                    stage2_mask[stage2_baseline_indices] = False
+                    
+                    # Filter stage2 batch
+                    stage2_indices_to_keep = torch.where(stage2_mask)[0].tolist()
+                    stage2_repeated_batch = stage2_repeated_batch.filter(stage2_indices_to_keep)
+                    stage2_advantages = stage2_advantages[stage2_mask]
+                    
+                    print(f"  • Filtered out {len(stage2_baseline_indices)} baseline plan judgments from training")
+                
                 # Update message logs with advantages for stage 1
                 for i, message_log in enumerate(stage1_repeated_batch["message_log"]):
                     for message in message_log:
@@ -1183,7 +1275,7 @@ def plan_grpo_train(
                     log_data = extract_plan_grpo_log_data(
                         batch,
                         stage1_repeated_batch,
-                        stage1_rewards,
+                        stage1_generated_plan_rewards,  # Use the rewards for generated plans only
                         stage2_repeated_batch,
                         stage2_rewards,
                         master_config["plan_grpo"]["num_plans_per_prompt"],
