@@ -808,30 +808,83 @@ def plan_grpo_train(
         val_metrics, validation_timings = None, None
 
         with timer.time("total_step_time"):
+            # Check if we should skip stage 1
+            skip_stage1 = master_config["plan_grpo"].get("skip_stage1", False)
+            use_baseline_plan = master_config["plan_grpo"].get("use_baseline_plan", False)
+            
+            if skip_stage1 and not use_baseline_plan:
+                raise ValueError("skip_stage1 requires use_baseline_plan to be True")
+            
             # ============== Stage 1: Plan Generation ==============
-            print("\n▶ Stage 1: Plan Generation...")
-            with timer.time("stage1_preparation"):
-                # Create plan generation prompts
-                plan_batch = create_plan_prompts(
-                    batch,
-                    master_config["plan_grpo"]["plan_prompt_template"],
-                    tokenizer,
-                )
-                
-                # Repeat batch items for multiple plan generations
-                stage1_repeated_batch: BatchedDataDict[DatumSpec] = plan_batch.repeat_interleave(
-                    master_config["plan_grpo"]["num_plans_per_prompt"]
-                )
-                # Convert LLMMessageLogType to FlatMessagesType for generation and save prompt ids
-                batched_flat_pre_gen, _ = batched_message_log_to_flat_message(
-                    stage1_repeated_batch["message_log"],
-                    pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                )
-                stage1_input_ids = batched_flat_pre_gen["token_ids"]  # prompt-only ids (no assistant)
+            if not skip_stage1:
+                print("\n▶ Stage 1: Plan Generation...")
+            else:
+                print("\n▶ Stage 1: Skipped (using baseline plan only)")
+            
+            # Initialize variables that will be used later
+            stage1_repeated_batch = None
+            stage1_rollout_metrics = {}
+            stage1_input_ids = None
+            
+            if not skip_stage1:
+                with timer.time("stage1_preparation"):
+                    # Create plan generation prompts
+                    plan_batch = create_plan_prompts(
+                        batch,
+                        master_config["plan_grpo"]["plan_prompt_template"],
+                        tokenizer,
+                    )
+                    
+                    # Repeat batch items for multiple plan generations
+                    stage1_repeated_batch: BatchedDataDict[DatumSpec] = plan_batch.repeat_interleave(
+                        master_config["plan_grpo"]["num_plans_per_prompt"]
+                    )
+                    # Convert LLMMessageLogType to FlatMessagesType for generation and save prompt ids
+                    batched_flat_pre_gen, _ = batched_message_log_to_flat_message(
+                        stage1_repeated_batch["message_log"],
+                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                    )
+                    stage1_input_ids = batched_flat_pre_gen["token_ids"]  # prompt-only ids (no assistant)
 
-            # Generate plans for stage 1
-            print(f"  • Generating {stage1_repeated_batch.size} evaluation plans...")
-            with timer.time("stage1_generation_prep"):
+                # Generate plans for stage 1
+                print(f"  • Generating {stage1_repeated_batch.size} evaluation plans...")
+                with timer.time("stage1_generation_prep"):
+                    if NEED_REFIT and POLICY_GENERATION_STALE:
+                        refit_policy_generation(
+                            policy,
+                            policy_generation,
+                            refit_buffer_size_gb,
+                        )
+                        POLICY_GENERATION_STALE = False
+                    else:
+                        policy_generation.prepare_for_generation()
+
+                with timer.time("stage1_generation"):
+                    stage1_repeated_batch, stage1_rollout_metrics = run_multi_turn_rollout(
+                        policy_generation=policy_generation,
+                        input_batch=stage1_repeated_batch,
+                        tokenizer=tokenizer,
+                        task_to_env=task_to_env,
+                        max_seq_len=master_config["policy"]["max_total_sequence_length"],
+                        max_rollout_turns=master_config["plan_grpo"]["max_rollout_turns"],
+                        greedy=False,
+                    )
+                    
+                    # Keep generation active for stage 2
+
+                # Apply environment post-processing for stage 1 (plans)
+                print("  • Applying stage 1 environment post-processing...")
+                with timer.time("stage1_env_post_processing"):
+                    if master_config["plan_grpo"].get("skip_stage1_env_post_processing", False):
+                        stage1_env_metrics = {}
+                        print("    (Skipped - skip_stage1_env_post_processing is enabled)")
+                    else:
+                        stage1_repeated_batch, stage1_env_metrics = apply_environment_post_processing(
+                            stage1_repeated_batch, task_to_env, prefix="stage1_"
+                        )
+                    stage1_rollout_metrics.update(stage1_env_metrics)
+            else:
+                # When skipping stage1, we need to prepare for generation here
                 if NEED_REFIT and POLICY_GENERATION_STALE:
                     refit_policy_generation(
                         policy,
@@ -842,82 +895,62 @@ def plan_grpo_train(
                 else:
                     policy_generation.prepare_for_generation()
 
-            with timer.time("stage1_generation"):
-                stage1_repeated_batch, stage1_rollout_metrics = run_multi_turn_rollout(
-                    policy_generation=policy_generation,
-                    input_batch=stage1_repeated_batch,
-                    tokenizer=tokenizer,
-                    task_to_env=task_to_env,
-                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
-                    max_rollout_turns=master_config["plan_grpo"]["max_rollout_turns"],
-                    greedy=False,
-                )
-                
-                # Keep generation active for stage 2
-
-            # Apply environment post-processing for stage 1 (plans)
-            print("  • Applying stage 1 environment post-processing...")
-            with timer.time("stage1_env_post_processing"):
-                if master_config["plan_grpo"].get("skip_stage1_env_post_processing", False):
-                    stage1_env_metrics = {}
-                    print("    (Skipped - skip_stage1_env_post_processing is enabled)")
-                else:
-                    stage1_repeated_batch, stage1_env_metrics = apply_environment_post_processing(
-                        stage1_repeated_batch, task_to_env, prefix="stage1_"
-                    )
-                stage1_rollout_metrics.update(stage1_env_metrics)
-
             # Extract stage 1 plans
             num_prompts = len(batch["message_log"])
             num_plans = master_config["plan_grpo"]["num_plans_per_prompt"]
-            use_baseline_plan = master_config["plan_grpo"].get("use_baseline_plan", False)
             
             # Get reasoning split word from any enabled environment
             reasoning_split_word = get_reasoning_split_word(master_config["env"])
             
-            # Group plans by original prompt and track JSON parsing failures
             stage1_plans = []
             json_parse_failures = []  # Track which plans failed JSON parsing
-            for i in range(num_prompts):
-                prompt_plans = []
-                for j in range(num_plans):
-                    idx = i * num_plans + j
-                    # Extract assistant response (plan) from the message log
-                    last_assistant_response = None
-                    for message in stage1_repeated_batch["message_log"][idx]:
-                        if message["role"] == "assistant":
-                            last_assistant_response = message["content"]
-                    if last_assistant_response is not None:
-                        if reasoning_split_word and reasoning_split_word in last_assistant_response:
-                            # Remove reasoning part if split word exists
-                            last_assistant_response = last_assistant_response.split(reasoning_split_word)[-1].lstrip()
-                        
-                        # Try to parse JSON response to extract plan
-                        try:
-                            json_response = json.loads(last_assistant_response)
-                            if isinstance(json_response, dict) and "plan" in json_response:
-                                prompt_plans.append(json_response["plan"])
-                                json_parse_failures.append(False)
-                            else:
-                                # Fallback to simple default plan if not proper JSON format
+            
+            if not skip_stage1:
+                # Group plans by original prompt and track JSON parsing failures
+                for i in range(num_prompts):
+                    prompt_plans = []
+                    for j in range(num_plans):
+                        idx = i * num_plans + j
+                        # Extract assistant response (plan) from the message log
+                        last_assistant_response = None
+                        for message in stage1_repeated_batch["message_log"][idx]:
+                            if message["role"] == "assistant":
+                                last_assistant_response = message["content"]
+                        if last_assistant_response is not None:
+                            if reasoning_split_word and reasoning_split_word in last_assistant_response:
+                                # Remove reasoning part if split word exists
+                                last_assistant_response = last_assistant_response.split(reasoning_split_word)[-1].lstrip()
+                            
+                            # Try to parse JSON response to extract plan
+                            try:
+                                json_response = json.loads(last_assistant_response)
+                                if isinstance(json_response, dict) and "plan" in json_response:
+                                    prompt_plans.append(json_response["plan"])
+                                    json_parse_failures.append(False)
+                                else:
+                                    # Fallback to simple default plan if not proper JSON format
+                                    default_plan = "First generate your own response, compare with the provided response and judge them."
+                                    prompt_plans.append(default_plan)
+                                    json_parse_failures.append(True)
+                                    print(f"  ⚠️ Plan {idx}: Invalid JSON format (missing 'plan' key) - using default plan")
+                            except (json.JSONDecodeError, ValueError) as e:
+                                # Fallback to simple default plan if JSON parsing fails
                                 default_plan = "First generate your own response, compare with the provided response and judge them."
                                 prompt_plans.append(default_plan)
                                 json_parse_failures.append(True)
-                                print(f"  ⚠️ Plan {idx}: Invalid JSON format (missing 'plan' key) - using default plan")
-                        except (json.JSONDecodeError, ValueError) as e:
-                            # Fallback to simple default plan if JSON parsing fails
+                                print(f"  ⚠️ Plan {idx}: JSON parsing failed - {str(e)[:50]}... - using default plan")
+                        else:
+                            # Use default plan if no assistant response found
                             default_plan = "First generate your own response, compare with the provided response and judge them."
                             prompt_plans.append(default_plan)
                             json_parse_failures.append(True)
-                            print(f"  ⚠️ Plan {idx}: JSON parsing failed - {str(e)[:50]}... - using default plan")
-                    else:
-                        # Use default plan if no assistant response found
-                        default_plan = "First generate your own response, compare with the provided response and judge them."
-                        prompt_plans.append(default_plan)
-                        json_parse_failures.append(True)
-                        print(f"  ⚠️ Plan {idx}: No assistant response found - using default plan")
-                
-                stage1_plans.append(prompt_plans)
+                            print(f"  ⚠️ Plan {idx}: No assistant response found - using default plan")
+                    
+                    stage1_plans.append(prompt_plans)
+            else:
+                # When skipping stage1, create empty plan lists that will be filled with baseline plan
+                for i in range(num_prompts):
+                    stage1_plans.append([])  # Empty list that will have baseline plan added in stage 2
             
             # ============== Stage 2: Judgments using Plans ==============
             print("\n▶ Stage 2: Judgments using Plans...")
@@ -929,8 +962,12 @@ def plan_grpo_train(
                         "baseline_plan_template",
                         "Carefully evaluate both responses by checking accuracy, completeness, and helpfulness. Compare them fairly and provide detailed reasoning."
                     )
-                    # Create a copy and add baseline plan to each prompt's plans
-                    stage2_plans = [plans + [baseline_plan] for plans in stage1_plans]
+                    if skip_stage1:
+                        # When skipping stage1, only use the baseline plan
+                        stage2_plans = [[baseline_plan] for _ in range(num_prompts)]
+                    else:
+                        # Create a copy and add baseline plan to each prompt's plans
+                        stage2_plans = [plans + [baseline_plan] for plans in stage1_plans]
                 
                 # Create judgment prompts using the plans
                 judgment_batch = create_judgment_prompts(
@@ -986,9 +1023,13 @@ def plan_grpo_train(
             with timer.time("reward_calculation"):
                 # Aggregate judgment rewards to get plan rewards
                 # Note: num_plans_to_aggregate includes baseline plan if enabled
-                num_plans_to_aggregate = master_config["plan_grpo"]["num_plans_per_prompt"]
-                if use_baseline_plan:
-                    num_plans_to_aggregate += 1
+                if skip_stage1:
+                    # When skipping stage1, we only have 1 plan per prompt (baseline)
+                    num_plans_to_aggregate = 1
+                else:
+                    num_plans_to_aggregate = master_config["plan_grpo"]["num_plans_per_prompt"]
+                    if use_baseline_plan:
+                        num_plans_to_aggregate += 1
                     
                 stage1_rewards = aggregate_judgment_rewards_to_plans(
                     stage1_rewards=None,  # Not used, will be replaced
@@ -998,33 +1039,40 @@ def plan_grpo_train(
                     num_judgments_per_plan=master_config["plan_grpo"]["num_judgments_per_plan"],
                 )
                 
-                # If using baseline plan, we need to handle the fact that stage1 only has 8 plans
-                # but stage2 has 9 plans (8 generated + 1 baseline)
-                if use_baseline_plan:
-                    # Extract rewards for generated plans only (first 8)
-                    stage1_generated_plan_rewards = stage1_rewards.view(num_prompts, num_plans_to_aggregate)[:, :num_plans].reshape(-1)
-                    
-                    # Apply penalty for plans that failed JSON parsing (only for generated plans)
-                    json_parse_failures_generated = json_parse_failures[:len(stage1_generated_plan_rewards)]
-                    json_parse_failures_tensor = torch.tensor(json_parse_failures_generated, dtype=torch.bool)
-                    penalty_reward = master_config["plan_grpo"].get("json_parse_failure_penalty", -50.0)
-                    stage1_generated_plan_rewards[json_parse_failures_tensor] = penalty_reward
-                    
-                    # Update stage1 batch with rewards (only for generated plans)
-                    stage1_repeated_batch["total_reward"] = stage1_generated_plan_rewards
-                    
-                    # Keep full rewards including baseline for later use
-                    stage1_all_plan_rewards = stage1_rewards
+                if skip_stage1:
+                    # When skipping stage1, we don't have any generated plans to process
+                    stage1_generated_plan_rewards = torch.empty(0)  # Empty tensor
+                    stage1_all_plan_rewards = stage1_rewards  # Only baseline plan rewards
+                    # No JSON parsing failures when skipping stage1
+                    json_parse_failures_tensor = torch.zeros(0, dtype=torch.bool)
                 else:
-                    # Apply penalty for plans that failed JSON parsing
-                    json_parse_failures_tensor = torch.tensor(json_parse_failures, dtype=torch.bool)
-                    penalty_reward = master_config["plan_grpo"].get("json_parse_failure_penalty", -50.0)
-                    stage1_rewards[json_parse_failures_tensor] = penalty_reward
-                    
-                    # Update stage1 batch with calculated rewards
-                    stage1_repeated_batch["total_reward"] = stage1_rewards
-                    stage1_all_plan_rewards = stage1_rewards
-                    stage1_generated_plan_rewards = stage1_rewards
+                    # If using baseline plan, we need to handle the fact that stage1 only has 8 plans
+                    # but stage2 has 9 plans (8 generated + 1 baseline)
+                    if use_baseline_plan:
+                        # Extract rewards for generated plans only (first 8)
+                        stage1_generated_plan_rewards = stage1_rewards.view(num_prompts, num_plans_to_aggregate)[:, :num_plans].reshape(-1)
+                        
+                        # Apply penalty for plans that failed JSON parsing (only for generated plans)
+                        json_parse_failures_generated = json_parse_failures[:len(stage1_generated_plan_rewards)]
+                        json_parse_failures_tensor = torch.tensor(json_parse_failures_generated, dtype=torch.bool)
+                        penalty_reward = master_config["plan_grpo"].get("json_parse_failure_penalty", -50.0)
+                        stage1_generated_plan_rewards[json_parse_failures_tensor] = penalty_reward
+                        
+                        # Update stage1 batch with rewards (only for generated plans)
+                        stage1_repeated_batch["total_reward"] = stage1_generated_plan_rewards
+                        
+                        # Keep full rewards including baseline for later use
+                        stage1_all_plan_rewards = stage1_rewards
+                    else:
+                        # Apply penalty for plans that failed JSON parsing
+                        json_parse_failures_tensor = torch.tensor(json_parse_failures, dtype=torch.bool)
+                        penalty_reward = master_config["plan_grpo"].get("json_parse_failure_penalty", -50.0)
+                        stage1_rewards[json_parse_failures_tensor] = penalty_reward
+                        
+                        # Update stage1 batch with calculated rewards
+                        stage1_repeated_batch["total_reward"] = stage1_rewards
+                        stage1_all_plan_rewards = stage1_rewards
+                        stage1_generated_plan_rewards = stage1_rewards
                 
                 # Log statistics about JSON parsing failures
                 num_failures = json_parse_failures_tensor.sum().item()
@@ -1034,55 +1082,61 @@ def plan_grpo_train(
                 # Calculate advantages for plans
                 print("  • Computing plan advantages...")
                 
-                # Extract baseline plan rewards if using baseline plan
-                baseline_plan_rewards = None
-                if use_baseline_plan:
-                    # Baseline plan is the last plan for each prompt in the full rewards
-                    baseline_indices = [(i+1) * num_plans_to_aggregate - 1 for i in range(num_prompts)]
-                    baseline_plan_rewards = stage1_all_plan_rewards[baseline_indices]
-                    
-                    # For GRPO baseline calculation, use only the generated plans
-                    stage1_rewards_for_grpo = stage1_generated_plan_rewards
-                    stage1_input_ids_for_grpo = stage1_input_ids
+                if skip_stage1:
+                    # When skipping stage1, we don't calculate advantages for plans
+                    # as there are no generated plans to train on
+                    stage1_advantages = torch.empty(0)
+                    print("    (No plan advantages - training only on judgments)")
                 else:
-                    stage1_rewards_for_grpo = stage1_repeated_batch["total_reward"]
-                    stage1_input_ids_for_grpo = stage1_input_ids
-                
-                # Check for potentially problematic configuration
-                expected_responses = master_config["plan_grpo"]["num_plans_per_prompt"] if master_config["plan_grpo"].get("check_baseline_correctness", True) else None
-                
-                # Get prompts for baseline calculation (use stage1 input ids)
-                stage1_grpo_baseline, stage1_grpo_std, stage1_grpo_metrics = calculate_baseline_and_std_per_prompt(
-                    prompts=stage1_input_ids_for_grpo,
-                    rewards=stage1_rewards_for_grpo,
-                    valid_mask=torch.ones_like(stage1_rewards_for_grpo),
-                    leave_one_out_baseline=master_config["plan_grpo"]["use_leave_one_out_baseline"],
-                    expected_responses_per_prompt=expected_responses,
-                )
-                stage1_rollout_metrics.update(stage1_grpo_metrics)
-                
-                # Apply max with baseline plan rewards if enabled
-                if use_baseline_plan:
-                    # Apply max operation: baseline = max(GRPO_baseline, baseline_plan_reward)
-                    baseline_plan_rewards_expanded = baseline_plan_rewards.repeat_interleave(num_plans)
-                    stage1_final_baseline = torch.maximum(stage1_grpo_baseline, baseline_plan_rewards_expanded)
+                    # Extract baseline plan rewards if using baseline plan
+                    baseline_plan_rewards = None
+                    if use_baseline_plan:
+                        # Baseline plan is the last plan for each prompt in the full rewards
+                        baseline_indices = [(i+1) * num_plans_to_aggregate - 1 for i in range(num_prompts)]
+                        baseline_plan_rewards = stage1_all_plan_rewards[baseline_indices]
+                        
+                        # For GRPO baseline calculation, use only the generated plans
+                        stage1_rewards_for_grpo = stage1_generated_plan_rewards
+                        stage1_input_ids_for_grpo = stage1_input_ids
+                    else:
+                        stage1_rewards_for_grpo = stage1_repeated_batch["total_reward"]
+                        stage1_input_ids_for_grpo = stage1_input_ids
                     
-                    # Log baseline plan effectiveness
-                    baseline_improvement = (baseline_plan_rewards_expanded > stage1_grpo_baseline).float().mean()
-                    stage1_rollout_metrics["baseline_plan_improvement_ratio"] = float(baseline_improvement)
-                    stage1_rollout_metrics["baseline_plan_reward_mean"] = float(baseline_plan_rewards.mean())
-                else:
-                    stage1_final_baseline = stage1_grpo_baseline
-                
-                # Calculate advantages only for generated plans
-                stage1_advantages = (stage1_generated_plan_rewards - stage1_final_baseline).unsqueeze(-1)
-                
-                if master_config["plan_grpo"]["normalize_rewards"]:
-                    # Don't sharpen the ones with no variation
-                    zero_std_mask = stage1_grpo_std > 0
-                    stage1_advantages[zero_std_mask] = (
-                        stage1_advantages[zero_std_mask] / stage1_grpo_std.unsqueeze(-1)[zero_std_mask]
+                    # Check for potentially problematic configuration
+                    expected_responses = master_config["plan_grpo"]["num_plans_per_prompt"] if master_config["plan_grpo"].get("check_baseline_correctness", True) else None
+                    
+                    # Get prompts for baseline calculation (use stage1 input ids)
+                    stage1_grpo_baseline, stage1_grpo_std, stage1_grpo_metrics = calculate_baseline_and_std_per_prompt(
+                        prompts=stage1_input_ids_for_grpo,
+                        rewards=stage1_rewards_for_grpo,
+                        valid_mask=torch.ones_like(stage1_rewards_for_grpo),
+                        leave_one_out_baseline=master_config["plan_grpo"]["use_leave_one_out_baseline"],
+                        expected_responses_per_prompt=expected_responses,
                     )
+                    stage1_rollout_metrics.update(stage1_grpo_metrics)
+                
+                    # Apply max with baseline plan rewards if enabled
+                    if use_baseline_plan:
+                        # Apply max operation: baseline = max(GRPO_baseline, baseline_plan_reward)
+                        baseline_plan_rewards_expanded = baseline_plan_rewards.repeat_interleave(num_plans)
+                        stage1_final_baseline = torch.maximum(stage1_grpo_baseline, baseline_plan_rewards_expanded)
+                        
+                        # Log baseline plan effectiveness
+                        baseline_improvement = (baseline_plan_rewards_expanded > stage1_grpo_baseline).float().mean()
+                        stage1_rollout_metrics["baseline_plan_improvement_ratio"] = float(baseline_improvement)
+                        stage1_rollout_metrics["baseline_plan_reward_mean"] = float(baseline_plan_rewards.mean())
+                    else:
+                        stage1_final_baseline = stage1_grpo_baseline
+                    
+                    # Calculate advantages only for generated plans
+                    stage1_advantages = (stage1_generated_plan_rewards - stage1_final_baseline).unsqueeze(-1)
+                    
+                    if master_config["plan_grpo"]["normalize_rewards"]:
+                        # Don't sharpen the ones with no variation
+                        zero_std_mask = stage1_grpo_std > 0
+                        stage1_advantages[zero_std_mask] = (
+                            stage1_advantages[zero_std_mask] / stage1_grpo_std.unsqueeze(-1)[zero_std_mask]
+                        )
                 
                 # Calculate advantages for judgments
                 print("  • Computing judgment advantages...")
@@ -1112,7 +1166,8 @@ def plan_grpo_train(
             print("\n▶ Preparing training data...")
             with timer.time("train_data_preparation"):
                 # Filter out baseline plan judgments from stage2 if using baseline plan
-                if use_baseline_plan:
+                # BUT only when not skipping stage1 (otherwise baseline judgments are all we have!)
+                if use_baseline_plan and not skip_stage1:
                     # Calculate which stage2 samples correspond to baseline plans
                     stage2_baseline_indices = []
                     for i in range(num_prompts):
@@ -1133,16 +1188,17 @@ def plan_grpo_train(
                     print(f"  • Filtered out {len(stage2_baseline_indices)} baseline plan judgments from training")
                 
                 # Update message logs with advantages for stage 1
-                for i, message_log in enumerate(stage1_repeated_batch["message_log"]):
-                    for message in message_log:
-                        if message["role"] == "assistant":
-                            if "generation_logprobs" not in message:
-                                message["generation_logprobs"] = torch.zeros_like(
-                                    message["token_ids"], dtype=torch.float32
+                if not skip_stage1:
+                    for i, message_log in enumerate(stage1_repeated_batch["message_log"]):
+                        for message in message_log:
+                            if message["role"] == "assistant":
+                                if "generation_logprobs" not in message:
+                                    message["generation_logprobs"] = torch.zeros_like(
+                                        message["token_ids"], dtype=torch.float32
+                                    )
+                                message["advantages"] = stage1_advantages[i].expand(
+                                    message["token_ids"].shape
                                 )
-                            message["advantages"] = stage1_advantages[i].expand(
-                                message["token_ids"].shape
-                            )
                 
                 # Update message logs with advantages for stage 2
                 for i, message_log in enumerate(stage2_repeated_batch["message_log"]):
@@ -1157,13 +1213,25 @@ def plan_grpo_train(
                             )
                 
                 # Convert updated message logs to flat messages for training
-                stage1_flat_messages, stage1_input_lengths = batched_message_log_to_flat_message(
-                    stage1_repeated_batch["message_log"],
-                    pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    make_sequence_length_divisible_by=master_config["policy"][
-                        "make_sequence_length_divisible_by"
-                    ],
-                )
+                if not skip_stage1:
+                    stage1_flat_messages, stage1_input_lengths = batched_message_log_to_flat_message(
+                        stage1_repeated_batch["message_log"],
+                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                        make_sequence_length_divisible_by=master_config["policy"][
+                            "make_sequence_length_divisible_by"
+                        ],
+                    )
+                    
+                    # Create training data from flattened messages
+                    stage1_train_data = BatchedDataDict[ClippedPGLossDataDict]({
+                        "input_ids": stage1_flat_messages["token_ids"],
+                        "input_lengths": stage1_input_lengths,
+                        "advantages": stage1_flat_messages["advantages"],
+                        "generation_logprobs": stage1_flat_messages["generation_logprobs"],
+                        "token_mask": stage1_flat_messages["token_loss_mask"],
+                        "sample_mask": stage1_repeated_batch["loss_multiplier"],
+                    })
+                    stage1_train_data.to("cpu")
                 
                 stage2_flat_messages, stage2_input_lengths = batched_message_log_to_flat_message(
                     stage2_repeated_batch["message_log"],
@@ -1172,17 +1240,6 @@ def plan_grpo_train(
                         "make_sequence_length_divisible_by"
                     ],
                 )
-                
-                # Create training data from flattened messages
-                stage1_train_data = BatchedDataDict[ClippedPGLossDataDict]({
-                    "input_ids": stage1_flat_messages["token_ids"],
-                    "input_lengths": stage1_input_lengths,
-                    "advantages": stage1_flat_messages["advantages"],
-                    "generation_logprobs": stage1_flat_messages["generation_logprobs"],
-                    "token_mask": stage1_flat_messages["token_loss_mask"],
-                    "sample_mask": stage1_repeated_batch["loss_multiplier"],
-                })
-                stage1_train_data.to("cpu")
                 
                 stage2_train_data = BatchedDataDict[ClippedPGLossDataDict]({
                     "input_ids": stage2_flat_messages["token_ids"],
@@ -1194,10 +1251,13 @@ def plan_grpo_train(
                 })
                 stage2_train_data.to("cpu")
                 
-                # Combine training data from both stages
-                combined_train_data = combine_training_data(
-                    stage1_train_data, stage2_train_data
-                )
+                # Combine training data from both stages or use stage2 only
+                if skip_stage1:
+                    combined_train_data = stage2_train_data
+                else:
+                    combined_train_data = combine_training_data(
+                        stage1_train_data, stage2_train_data
+                    )
 
             # ============== Logprob Inference ==============
             print("\n▶ Preparing for logprob inference...")
@@ -1271,7 +1331,7 @@ def plan_grpo_train(
                 
                 # Sample logging (not part of grpo config but useful for debugging)
                 sample_log_period = master_config["plan_grpo"].get("sample_log_period", 10)
-                if sample_log_period > 0 and step % sample_log_period == 0:
+                if sample_log_period > 0 and step % sample_log_period == 0 and not skip_stage1:
                     log_data = extract_plan_grpo_log_data(
                         batch,
                         stage1_repeated_batch,

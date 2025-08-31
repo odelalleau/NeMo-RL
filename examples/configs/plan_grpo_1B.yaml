@@ -30,6 +30,9 @@ plan_grpo:
   baseline_plan_template: |-
     Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user prompt. Begin your evaluation by generating your own answer to the prompt. You must provide your answer before judging any answers. When evaluating the assistants' answers, compare both assistants' answers with your answer. You must identify and correct any mistakes or inaccurate information. Then consider if the assistant's answers are helpful, relevant, and concise. Helpful means the answer correctly responds to the prompt or follows the instructions. Note when user prompt has any ambiguity or more than one interpretation, it is more helpful and appropriate to ask for clarifications or more information from the user than providing an answer based on assumptions. Relevant means all parts of the response closely connect or are appropriate to what is being asked. Concise means the response is clear and not verbose or excessive. Then consider the creativity and novelty of the assistant's answers when needed. Finally, identify any missing important information in the assistants' answers that would be beneficial to include when responding to the user prompt.
   
+  # Stage control
+  skip_stage1: false  # If true, skip stage 1 (plan generation) and only train on stage 2 (judgments) using baseline plan
+  
   # Prompt templates for plan GRPO
   plan_prompt_template: |-
     You are an expert evaluation planner. Given a conversation that ends with a user question, create a comprehensive evaluation plan for judging potential responses.
