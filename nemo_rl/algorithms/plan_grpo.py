@@ -166,17 +166,17 @@ def create_plan_prompts(
     new_message_logs = []
     
     for i, message_log in enumerate(original_batch["message_log"]):
-        # Extract the original question from metadata
+        # Extract the original conversation_history from metadata
         if "extra_env_info" not in original_batch or not original_batch["extra_env_info"][i]:
             raise ValueError(f"No extra_env_info found in batch for sample {i}")
         
-        original_question = original_batch["extra_env_info"][i].get("question")
-        if original_question is None:
-            raise ValueError(f"No question found in metadata for sample {i}")
+        conversation_history = original_batch["extra_env_info"][i].get("conversation_history")
+        if conversation_history is None:
+            raise ValueError(f"No conversation_history found in metadata for sample {i}")
         
         # Create the plan generation prompt using the template
         plan_prompt = plan_prompt_template.format(
-            original_question=original_question
+            conversation_history=conversation_history
         )
         
         # Create a proper message structure for chat template
@@ -253,7 +253,7 @@ def create_judgment_prompts(
             # Create the judgment prompt using the template
             judgment_prompt = judgment_prompt_template.format(
                 plan=plan,
-                question=original_metadata.get("question", ""),
+                conversation_history=original_metadata.get("conversation_history", ""),
                 response_1=original_metadata.get("response_1", ""),
                 response_2=original_metadata.get("response_2", "")
             )

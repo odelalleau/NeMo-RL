@@ -38,10 +38,10 @@ plan_grpo:
     You are an expert evaluation planner. Given a conversation that ends with a user question, create a comprehensive evaluation plan for judging potential responses.
     
     ## Conversation Context:
-    {original_question}
+    {conversation_history}
     
     ## Your Task:
-    Create a detailed, actionable plan that a judge can follow to evaluate responses to the user's question. The plan should be written in second person (using "you" to address the judge).
+    Create a detailed, actionable plan that a judge can follow to evaluate responses to the user's last question. The plan should be written in second person (using "you" to address the judge).
     
     ## Guidelines for Your Plan:
     1. Be specific and systematic - break down the evaluation into clear steps
