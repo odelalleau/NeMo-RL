@@ -13,19 +13,15 @@
 # limitations under the License.
 import os
 import json
-import random
 import time
-import math
-from collections import defaultdict, Counter
+from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, TypedDict, List
-from itertools import combinations
 
 import numpy as np
-import pandas as pd
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
@@ -66,6 +62,7 @@ from nemo_rl.utils.logger import (
     print_message_log_samples,
 )
 from nemo_rl.utils.timer import Timer
+from nemo_rl.algorithms.grpo import TimeLimitTimer, refit_policy_generation
 
 
 # ===============================================================================
@@ -235,6 +232,9 @@ def create_judgment_prompts(
     Returns:
         New batch with judgment prompts
     """
+    print(f"    DEBUG [create_judgment_prompts]: Starting with {len(plans)} prompts")
+    print(f"    DEBUG [create_judgment_prompts]: original_batch keys = {list(original_batch.keys())}")
+    
     # Create new message logs for judgment
     new_message_logs = []
     new_extra_env_info = []
@@ -242,11 +242,13 @@ def create_judgment_prompts(
     new_task_name = []
     
     for i, message_log in enumerate(original_batch["message_log"]):
+        print(f"    DEBUG [create_judgment_prompts]: Processing prompt {i}")
         # Get the original question and metadata from extra_env_info
         if "extra_env_info" not in original_batch or not original_batch["extra_env_info"][i]:
             raise ValueError(f"No extra_env_info found in batch for sample {i}")
         
         original_metadata = original_batch["extra_env_info"][i]
+        print(f"    DEBUG [create_judgment_prompts]: Plans for prompt {i}: {len(plans[i])} plans")
         
         # For each plan, create a judgment prompt
         for plan_idx, plan in enumerate(plans[i]):
@@ -267,6 +269,7 @@ def create_judgment_prompts(
             ]
             
             # Apply chat template to get properly formatted content and token_ids
+            print(f"    DEBUG [create_judgment_prompts]: Applying chat template for prompt {i}, plan {plan_idx}")
             formatted_content = tokenizer.apply_chat_template(
                 judgment_message,
                 tokenize=False,
@@ -300,6 +303,7 @@ def create_judgment_prompts(
     if len(new_message_logs) == 0:
         raise ValueError("No valid judgment prompts could be created from the plans")
     
+    print(f"    DEBUG [create_judgment_prompts]: Created {len(new_message_logs)} judgment prompts")
     print(f"  ✓ Created {len(new_message_logs)} judgment prompts from {len(original_batch['message_log'])} original prompts")
     
     # Create judgment batch with new data
@@ -354,7 +358,16 @@ class PlanGRPOSaveState(TypedDict):
     step: int
     optim_step: int
     consumed_samples: int
-    num_epochs: int
+    val_reward: float
+
+
+def _default_plan_grpo_save_state() -> PlanGRPOSaveState:
+    return {
+        "step": 0,
+        "optim_step": 0,
+        "val_reward": -99999999.0,
+        "consumed_samples": 0,
+    }
 
 
 class MasterConfig(TypedDict):
@@ -411,10 +424,10 @@ def apply_environment_post_processing(
         
         # Store results
         for i, idx in enumerate(indices):
-            all_returns.append({
-                "total_reward": env_result.rewards[i].item(),
-                **env_result.extra_info[i] if i < len(env_result.extra_info) else {}
-            })
+            result_dict = {"total_reward": env_result.rewards[i].item()}
+            if i < len(env_result.extra_info):
+                result_dict.update(env_result.extra_info[i])
+            all_returns.append(result_dict)
 
     # Update batch with results
     batch["total_reward"] = torch.tensor([r["total_reward"] for r in all_returns], dtype=torch.float32)
@@ -430,20 +443,6 @@ def apply_environment_post_processing(
     return batch, metrics
 
 
-class TimeLimitTimer:
-    """Timer to track time limits during training."""
-    def __init__(self, time_limit: Optional[str]):
-        self.time_limit = time_limit
-        self._start_time = None
-        
-    def start_time(self):
-        self._start_time = time.time()
-        
-    def is_finished(self) -> bool:
-        if self.time_limit is None or self._start_time is None:
-            return False
-        limit_seconds = pd.Timedelta(self.time_limit).total_seconds()
-        return (time.time() - self._start_time) >= limit_seconds
 
 
 def validate(
@@ -453,18 +452,21 @@ def validate(
     val_task_to_env: Dict[str, EnvironmentInterface],
     step: int,
     master_config: MasterConfig,
-    logger: Logger,
-) -> Tuple[Dict[str, float], Dict[str, float]]:
+    logger: Optional[Logger] = None,
+    num_repeats: int = 1,
+    return_data_for_saving: bool = False,
+    return_val_batch: bool = False,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Run validation for plan GRPO.
     
     Returns validation metrics and timing information.
     """
+    if val_dataloader is None:
+        print("  ⚠️ No validation dataloader provided, skipping validation")
+        return {}, {}
+    
     timer = Timer()
     all_metrics = {}
-    
-    print(f"\n{'='*60}")
-    print(f"Validation at step {step}")
-    print(f"{'='*60}")
     
     # For plan GRPO, we would need to:
     # 1. Generate plans for validation prompts
@@ -505,11 +507,10 @@ def setup(
     # ==========================
     #   Config Extraction
     # ==========================
-    generation_config = master_config["generation"]
     policy_config = master_config["policy"]
+    generation_config = policy_config["generation"]
     cluster_config = master_config["cluster"]
     data_config = master_config["data"]
-    val_data_config = master_config.get("val_data")
     loss_config = master_config["loss_fn"]
     logger_config = master_config["logger"]
     checkpointing_config = master_config["checkpointing"]
@@ -519,27 +520,37 @@ def setup(
     #   Checkpoint Management
     # ==========================
     print("\n▶ Setting up checkpointing...")
-    checkpointer = CheckpointManager(config=checkpointing_config)
-    last_checkpoint_path = checkpointer.find_last_checkpoint()
-    if last_checkpoint_path:
+    checkpointer = CheckpointManager(checkpointing_config)
+    last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    plan_grpo_save_state = checkpointer.load_training_info(last_checkpoint_path)
+    
+    if plan_grpo_save_state is not None:
         print(f"  ✓ Found checkpoint: {last_checkpoint_path}")
-        plan_grpo_save_state = checkpointer.load_state(last_checkpoint_path / "plan_grpo_state.pkl")
         print(f"    • Resuming from step: {plan_grpo_save_state['step']}")
         print(f"    • Consumed samples: {plan_grpo_save_state['consumed_samples']}")
     else:
         print("  ✓ No checkpoint found, starting fresh")
-        plan_grpo_save_state = PlanGRPOSaveState(
-            step=0,
-            optim_step=0,
-            consumed_samples=0,
-            num_epochs=plan_grpo_config["num_epochs"],
+        plan_grpo_save_state = _default_plan_grpo_save_state()
+
+    # config validation checks
+    if checkpointing_config["enabled"]:
+        assert checkpointing_config["save_period"] > 0
+        assert (
+            checkpointing_config["save_period"]
+            % plan_grpo_config["val_period"]
+            == 0
+        ), (
+            f"Checkpointing save period {checkpointing_config['save_period']} "
+            f"must be a multiple of validation period {plan_grpo_config['val_period']}"
+            f", or we won't know what metric to save!"
         )
 
     # ==========================
     #   Logger
     # ==========================
     print("\n▶ Setting up logger...")
-    logger = Logger(config=logger_config)
+    logger = Logger(logger_config)
+    logger.log_hyperparams(master_config)
     print(f"  ✓ Logger initialized")
 
     # ==========================
@@ -576,7 +587,7 @@ def setup(
     
     if last_checkpoint_path is not None:
         dataloader_state_dict = torch.load(
-            Path(last_checkpoint_path) / "train_dataloader.pt"
+            os.path.join(last_checkpoint_path, "train_dataloader.pt")
         )
         dataloader.load_state_dict(dataloader_state_dict)
     
@@ -586,25 +597,25 @@ def setup(
     # Validation dataset
     val_dataloader = None
     # If validation is enabled, load the validation dataloader
-    if plan_grpo_config["val_period"] > 0 or plan_grpo_config["val_at_start"]:
-        if val_dataset:
-            val_batch_size = min(plan_grpo_config["max_val_samples"], len(val_dataset))
-            if "val_batch_size" in plan_grpo_config:
-                val_batch_size = plan_grpo_config["val_batch_size"]
-            
-            val_dataloader = StatefulDataLoader(
-                val_dataset,
-                batch_size=val_batch_size,
-                shuffle=shuffle_val,
-                generator=val_data_generator,
-                collate_fn=rl_collate_fn,
-                drop_last=val_data_config["drop_last"] if val_data_config else False,
-            )
-            print(f"  ✓ Validation dataset loaded with {len(val_dataset)} examples")
-        else:
-            print("  ⚠️ Validation requested but no validation dataset provided")
+    if (plan_grpo_config["val_period"] > 0 or plan_grpo_config["val_at_start"]) and val_dataset is not None:
+        val_batch_size = min(plan_grpo_config["max_val_samples"], len(val_dataset))
+        if "val_batch_size" in plan_grpo_config:
+            val_batch_size = plan_grpo_config["val_batch_size"]
+        
+        val_dataloader = StatefulDataLoader(
+            val_dataset,
+            batch_size=val_batch_size,
+            shuffle=shuffle_val,
+            generator=val_data_generator,
+            collate_fn=rl_collate_fn,
+            drop_last=data_config["val"]["drop_last"] if "val" in data_config else False,
+        )
+        print(f"  ✓ Validation dataset loaded with {len(val_dataset)} examples")
     else:
-        print("  ℹ Validation disabled")
+        if plan_grpo_config["val_period"] > 0 or plan_grpo_config["val_at_start"]:
+            print("  ⚠️ Validation requested but no validation dataset provided")
+        else:
+            print("  ℹ Validation disabled")
 
 
 
@@ -612,7 +623,7 @@ def setup(
     #   Ray Cluster
     # ==========================
     print("\n▶ Setting up Ray cluster...")
-    colocated_inference = generation_config.get("max_colocated_worker_groups", 1) > 1
+    colocated_inference = generation_config["backend"] != "hf"
     cluster = RayVirtualCluster(
         name="plan_grpo_policy_cluster",
         bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
@@ -643,17 +654,10 @@ def setup(
             f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}"
         )
 
-    # Setup tokenizer if needed for HfPolicy
-    if 'tokenizer' in policy_config and 'name' in policy_config['tokenizer']:
-        from nemo_rl.algorithms.utils import get_tokenizer
-        policy_tokenizer = get_tokenizer(policy_config['tokenizer'])
-    else:
-        policy_tokenizer = tokenizer
-        
     policy = HfPolicy(
         cluster=cluster,
         config=policy_config,
-        tokenizer=policy_tokenizer,
+        tokenizer=tokenizer,
         weights_path=Path(last_checkpoint_path) / "policy" / "weights"
         if last_checkpoint_path
         else None,
@@ -691,43 +695,6 @@ def get_reasoning_split_word(env_configs: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def refit_policy_generation(
-    policy: PolicyInterface,
-    policy_generation: GenerationInterface,
-    refit_buffer_size_gb: int,  # GB
-):
-    """Refit the policy generation interface with the latest policy weights."""
-    policy.offload_before_refit()
-    policy_generation.prepare_for_generation(tags=["weights"])
-    # Streaming update weights to save memory
-    state_dict_info = policy.prepare_weights_for_ipc()
-    # group keys to save time
-    available_bytes = refit_buffer_size_gb * (1024**3)
-    split_keys, keys = [], []
-    for key, size_in_bytes in state_dict_info:
-        if size_in_bytes > available_bytes:
-            if keys:
-                split_keys.append(keys)
-                keys = []
-            available_bytes = refit_buffer_size_gb * (1024**3)
-
-        keys.append(key)
-        available_bytes -= size_in_bytes
-
-    if len(keys) > 0:
-        split_keys.append(keys)
-    # do update
-    for keys in split_keys:
-        ipc_handles = policy.get_weights_ipc_handles(keys)
-        if not policy_generation.update_weights(ipc_handles):
-            error_message = (
-                "❌ Error: Updating weights for the generation policy failed during refit.\n"
-                "This often indicates an issue with cuda-ipc or "
-                "a problem within the generation backend (e.g., vLLM worker).\n"
-            )
-            raise RuntimeError(error_message)
-    policy.offload_after_refit()
-    policy_generation.prepare_for_generation(tags=["kv_cache"])
 
 
 # ===============================================================================
@@ -808,6 +775,18 @@ def plan_grpo_train(
         val_metrics, validation_timings = None, None
 
         with timer.time("total_step_time"):
+            # Prepare generation backend once at the start of the step
+            with timer.time("generation_prep"):
+                if NEED_REFIT and POLICY_GENERATION_STALE:
+                    refit_policy_generation(
+                        policy,
+                        policy_generation,
+                        refit_buffer_size_gb,
+                    )
+                    POLICY_GENERATION_STALE = False
+                else:
+                    policy_generation.prepare_for_generation()
+            
             # Check if we should skip stage 1
             skip_stage1 = master_config["plan_grpo"].get("skip_stage1", False)
             use_baseline_plan = master_config["plan_grpo"].get("use_baseline_plan", False)
@@ -848,17 +827,6 @@ def plan_grpo_train(
 
                 # Generate plans for stage 1
                 print(f"  • Generating {stage1_repeated_batch.size} evaluation plans...")
-                with timer.time("stage1_generation_prep"):
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
-                        refit_policy_generation(
-                            policy,
-                            policy_generation,
-                            refit_buffer_size_gb,
-                        )
-                        POLICY_GENERATION_STALE = False
-                    else:
-                        policy_generation.prepare_for_generation()
-
                 with timer.time("stage1_generation"):
                     stage1_repeated_batch, stage1_rollout_metrics = run_multi_turn_rollout(
                         policy_generation=policy_generation,
@@ -884,16 +852,9 @@ def plan_grpo_train(
                         )
                     stage1_rollout_metrics.update(stage1_env_metrics)
             else:
-                # When skipping stage1, we need to prepare for generation here
-                if NEED_REFIT and POLICY_GENERATION_STALE:
-                    refit_policy_generation(
-                        policy,
-                        policy_generation,
-                        refit_buffer_size_gb,
-                    )
-                    POLICY_GENERATION_STALE = False
-                else:
-                    policy_generation.prepare_for_generation()
+                # When skipping stage1, we don't need to prepare generation backend here
+                # It will be prepared later before Stage 2 rollout
+                print("  DEBUG: skip_stage1=True -> generation backend will be prepared before Stage 2")
 
             # Extract stage 1 plans
             num_prompts = len(batch["message_log"])
@@ -954,6 +915,10 @@ def plan_grpo_train(
             
             # ============== Stage 2: Judgments using Plans ==============
             print("\n▶ Stage 2: Judgments using Plans...")
+            print(f"  DEBUG: num_prompts = {num_prompts}")
+            print(f"  DEBUG: len(batch['message_log']) = {len(batch['message_log'])}")
+            print(f"  DEBUG: skip_stage1 = {skip_stage1}")
+            print(f"  DEBUG: use_baseline_plan = {use_baseline_plan}")
             with timer.time("stage2_preparation"):
                 # If using baseline plan, add it to the plans for stage 2
                 stage2_plans = stage1_plans
@@ -969,27 +934,37 @@ def plan_grpo_train(
                         # Create a copy and add baseline plan to each prompt's plans
                         stage2_plans = [plans + [baseline_plan] for plans in stage1_plans]
                 
+                print(f"  DEBUG: stage2_plans created, length = {len(stage2_plans)}")
+                print(f"  DEBUG: First plan content = {stage2_plans[0] if stage2_plans else 'No plans'}")
+                
                 # Create judgment prompts using the plans
+                print("  DEBUG: Calling create_judgment_prompts...")
                 judgment_batch = create_judgment_prompts(
                     batch,
                     stage2_plans,
                     master_config["plan_grpo"]["judgment_prompt_template"],
                     tokenizer,
                 )
+                print(f"  DEBUG: create_judgment_prompts returned, batch size = {judgment_batch.size if hasattr(judgment_batch, 'size') else len(judgment_batch['message_log'])}")
                 
                 # Repeat each judgment prompt for multiple generations per plan
+                print(f"  DEBUG: Repeating judgment batch with num_judgments_per_plan = {master_config['plan_grpo']['num_judgments_per_plan']}")
                 stage2_repeated_batch = judgment_batch.repeat_interleave(
                     master_config["plan_grpo"]["num_judgments_per_plan"]
                 )
+                print(f"  DEBUG: stage2_repeated_batch created, size = {stage2_repeated_batch.size}")
                 
                 # Calculate input_ids for stage 2
+                print("  DEBUG: Calling batched_message_log_to_flat_message...")
                 stage2_flat_pre_rollout, _ = batched_message_log_to_flat_message(
                     stage2_repeated_batch["message_log"],
                     pad_value_dict={"token_ids": tokenizer.pad_token_id},
                 )
                 stage2_input_ids = stage2_flat_pre_rollout["token_ids"]
+                print(f"  DEBUG: batched_message_log_to_flat_message complete, input_ids shape = {stage2_input_ids.shape}")
 
             print(f"  • Generating {stage2_repeated_batch.size} judgments...")
+            
             with timer.time("stage2_generation"):
                 stage2_repeated_batch, stage2_rollout_metrics = run_multi_turn_rollout(
                     policy_generation=policy_generation,
@@ -1001,7 +976,7 @@ def plan_grpo_train(
                     greedy=False,
                 )
                 
-                policy_generation.finish_generation()
+                # Keep generation active until end of step
 
             # Apply environment post-processing for stage 2 (judgments)
             print("  • Applying stage 2 environment post-processing...")
@@ -1343,6 +1318,11 @@ def plan_grpo_train(
                     )
                     logger.log_table("plan_grpo_samples", log_data, step)
 
+            # ============== Finish Generation ==============
+            # Finish generation at the end of the step (like PT-GRPO)
+            policy_generation.finish_generation()
+            POLICY_GENERATION_STALE = True  # Mark as stale for next step
+            
             # Update counters
             step += 1
             consumed_samples += batch.size
@@ -1372,14 +1352,34 @@ def plan_grpo_train(
                 logger.log_metrics(validation_timings, step, prefix="timing/validation")
 
             # ============== Checkpointing ==============
-            if checkpointer.should_checkpoint(step):
+            is_last_step = step >= max_num_steps - 1
+            if master_config["checkpointing"]["enabled"] and (
+                is_last_step
+                or step % master_config["checkpointing"]["save_period"] == 0
+                or time_limit_timer.is_finished()
+            ):
                 print("\n💾 Saving checkpoint...")
+                policy.prepare_for_training()
+                
+                # Update save state with latest validation reward if available
+                if val_metrics:
+                    plan_grpo_save_state["val_reward"] = val_metrics.get("reward/mean", -99999999.0)
+                
                 with timer.time("checkpointing"):
-                    checkpointer.save_checkpoint(
-                        step=step,
-                        policy=policy,
-                        plan_grpo_state=plan_grpo_save_state,
+                    checkpoint_path = checkpointer.init_tmp_checkpoint(
+                        step, plan_grpo_save_state, master_config
                     )
+                    policy.save_checkpoint(
+                        weights_path=os.path.join(checkpoint_path, "policy", "weights"),
+                        optimizer_path=os.path.join(checkpoint_path, "policy", "optimizer"),
+                        tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
+                    )
+                    torch.save(
+                        dataloader.state_dict(),
+                        os.path.join(checkpoint_path, "train_dataloader.pt"),
+                    )
+                    checkpointer.finalize_checkpoint(checkpoint_path)
+                policy.offload_after_refit()
                 print(f"  ✓ Checkpoint saved at step {step}")
 
     print("\n" + "=" * 60)

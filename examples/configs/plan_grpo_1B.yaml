@@ -101,13 +101,13 @@ plan_grpo:
     #### Output Format ####
     Analyze step by step following the evaluation plan, then provide your judgment as JSON:
     ```json
-    {
+    {{
       "response_1_analysis": "Your detailed analysis of Response 1 based on the evaluation plan",
       "response_2_analysis": "Your detailed analysis of Response 2 based on the evaluation plan",
       "score_1": <1-5>,
       "score_2": <1-5>,
       "ranking": <1-6>
-    }
+    }}
     ```
 
 loss_fn:
