@@ -335,17 +335,17 @@ def forward_step_arbitrary_loss(
             attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
                 data=input_ids,
                 eod_token=0,  # used for loss_mask, which we don't use
-                pad_token=0,  # used for loss_mask, which we don't use
+                # pad_token=0,  # used for loss_mask, which we don't use
                 reset_position_ids=False,
                 reset_attention_mask=False,
                 eod_mask_loss=False,
-                pad_mask_loss=False,
+                # pad_mask_loss=False,
             )
 
     with straggler_timer:
         additional_kwargs = {}
-        if packed_seq_params is not None:
-            additional_kwargs["packed_seq_params"] = packed_seq_params
+        # if packed_seq_params is not None:
+        #     additional_kwargs["packed_seq_params"] = packed_seq_params
         output_tensor = model(
             input_ids_cp_sharded,
             position_ids,

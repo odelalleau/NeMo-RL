@@ -51,8 +51,11 @@ class OpenAIFormatDataset:
         train_original_dataset = load_dataset("json", data_files=train_ds_path)["train"]
         val_original_dataset = load_dataset("json", data_files=val_ds_path)["train"]
 
-        formatted_train_dataset = train_original_dataset.map(self.add_messages_key)
-        formatted_val_dataset = val_original_dataset.map(self.add_messages_key)
+        formatted_train_dataset_1 = train_original_dataset.map(self.add_messages_key)
+        formatted_val_dataset_1 = val_original_dataset.map(self.add_messages_key)
+
+        formatted_train_dataset = formatted_train_dataset_1.filter(lambda x: x["messages"][-1]["role"] == "assistant")
+        formatted_val_dataset = formatted_val_dataset_1.filter(lambda x: x["messages"][-1]["role"] == "assistant")
 
         self.formatted_ds = {
             "train": formatted_train_dataset,
@@ -74,5 +77,6 @@ class OpenAIFormatDataset:
             ] + messages
         elif self.system_prompt:
             messages = [{"role": "system", "content": self.system_prompt}] + messages
-        assert messages[-1]["role"] == "assistant"
+        # assert messages[-1]["role"] == "assistant", f"expect assistant found {messages[-1]['role']}"
         return {"messages": messages}
+

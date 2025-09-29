@@ -60,14 +60,14 @@ automodel = [
     # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
     # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
     # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
-    # "vllm==0.10.0",  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/811 resolved
-    "vllm",
+    "vllm==0.10.2",  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/811 resolved
+    # "vllm",
     "flash-attn==2.7.4.post1",
     "mamba-ssm",
     "causal-conv1d",
 ]
 # vllm = ["cuda-python", "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c", "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@e3908bf5bd0cc6265bcb225d15cd8c996d4759ef", "vllm", "num2words>=0.5.14", "flash-attn==2.7.4.post1", "mamba-ssm", "causal-conv1d"]
-vllm = ["cuda-python", "vllm", "num2words>=0.5.14", "flash-attn==2.7.4.post1", "mamba-ssm", "causal-conv1d"]
+vllm = ["cuda-python", "num2words>=0.5.14", "flash-attn==2.7.4.post1", "mamba-ssm", "causal-conv1d", "vllm"]
 mcore = [
     # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
     # wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
@@ -78,12 +78,15 @@ mcore = [
     # This dependency also needs to be compatible with the spec in Megatron-Bridge/pyproject.toml.
     # It is specified here since we don't directly use Megatron-Bridge/pyproject.toml, but a proxy setup.py+pyproject.toml combo
     # outside to allow "optionally" installing the megatron path. It's simpler to deal with transformer-engine here in the NeMo RL pyproject.toml
-    "transformer-engine[pytorch]==2.5.0",
+    # "transformer-engine[pytorch]==2.5.0", # change ybga#o
+    # "transformer-engine[pytorch]>=2.6.0a0,<2.8.0",
+    "transformer-engine",
+    "transformer-engine-torch",
     "megatron-core",
     "megatron-bridge",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
-    # "vllm==0.10.0",
-    "vllm",
+    "vllm==0.10.2",
+    # "vllm",
     # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
     # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
     # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
@@ -138,6 +141,7 @@ test = [
 megatron-core = { workspace = true }
 nemo-automodel = { workspace = true }
 megatron-bridge = { workspace = true }
+# transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "0289e76380088358a584d809faf69effab1a7cda" } # on `release_v2.7
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
 # torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
 torch = [
@@ -154,7 +158,8 @@ triton = [
 ]
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "08e5fee24bdc3bebce262e8e44bfed3ff640443c" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "6b32be06d026e170b3fdaf3ae6282c5a6ff57b06" }
-vllm = {path = "3rdparty/vllm", editable = true}  # <-- ADD AN ENTRY
+# vllm = {path = "3rdparty/vllm", editable = true}  # <-- ADD AN ENTRY
+vllm = {path = "3rdparty/vllm", editable = true}
 
 [tool.uv.workspace]
 members = [

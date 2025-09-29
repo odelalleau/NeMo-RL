@@ -61,9 +61,12 @@ from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.bridge.utils.instantiate_utils import InstantiationMode
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+# from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+#     FullyShardedDataParallel as custom_FSDP,
+# )
+from megatron.core.distributed.custom_fsdp import (
     FullyShardedDataParallel as custom_FSDP,
-)
+)   # ybgao
 from megatron.core.inference.engines import (
     StaticInferenceEngine,
 )
@@ -279,9 +282,9 @@ def setup_megatron_model(
         overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
         data_parallel_random_init=cfg.rng.data_parallel_random_init,
         pre_wrap_hook=pre_wrap_hook,
-        wrap_cast_model_output_to_fp32=(
-            not policy_cfg["megatron_cfg"].get("defer_fp32_logits", None)
-        ),
+        # wrap_cast_model_output_to_fp32=(   # ybgao
+        #     not policy_cfg["megatron_cfg"].get("defer_fp32_logits", None)
+        # ),
     )
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(
@@ -514,6 +517,7 @@ class MegatronPolicyWorker:
                 f"Pretrained run config not found at {pretrained_run_config} on rank={get_rank_safe()}. This usually means that the one-time HF->mcore conversion on rank=0 saved to a directory not being mounted on this node. Please check "
             )
 
+        print("pretrained_run_config", pretrained_run_config)
         cfg_from_pretrained = ConfigContainer.from_yaml(
             pretrained_run_config, mode=InstantiationMode.STRICT
         )
@@ -717,9 +721,9 @@ class MegatronPolicyWorker:
                 use_torch_fsdp2=self.megatron_cfg.dist.use_torch_fsdp2,
                 overlap_param_gather_with_optimizer_step=self.megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
                 pre_wrap_hook=self.megatron_cfg.rng.data_parallel_random_init,
-                wrap_cast_model_output_to_fp32=(
-                    not self.cfg["megatron_cfg"].get("defer_fp32_logits", None)
-                ),
+                # wrap_cast_model_output_to_fp32=(
+                #     not self.cfg["megatron_cfg"].get("defer_fp32_logits", None)
+                # ),
             )
             print("Loading the Reference Model")
             if (
@@ -777,7 +781,8 @@ class MegatronPolicyWorker:
             ],
             trust_remote_code=True,
         )
-        self.final_padded_vocab_size = tokenizer_config.padded_vocab_size
+        # self.final_padded_vocab_size = tokenizer_config.padded_vocab_size
+        self.final_padded_vocab_size = tokenizer_config.vocab_size
         self.dp_size = worker_sharding_annotations.get_axis_size("data_parallel")
         self.megatron_bridge = AutoBridge.from_hf_pretrained(
             hf_model_name, trust_remote_code=True
@@ -982,7 +987,7 @@ class MegatronPolicyWorker:
                         micro_batch_size=mbs,
                         decoder_seq_length=seq_dim_size,
                         forward_only=eval_mode,
-                        do_not_average_loss=True,
+                        # do_not_average_loss=True,
                     )
 
                 # Empty unused memory.
@@ -1175,11 +1180,11 @@ class MegatronPolicyWorker:
                 attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
                     data=input_ids,
                     eod_token=0,  # used for loss_mask, which we don't use
-                    pad_token=0,  # used for loss_mask, which we don't use
+                    # pad_token=0,  # used for loss_mask, which we don't use  # ybgao
                     reset_position_ids=False,
                     reset_attention_mask=False,
                     eod_mask_loss=False,
-                    pad_mask_loss=False,
+                    # pad_mask_loss=False,  # ybgao
                 )
                 packed_seq_params = None
                 unpacked_input_ids = input_ids
@@ -1807,6 +1812,7 @@ class MegatronPolicyWorker:
                             move_params=move_params, move_grads=move_grads
                         )
                     elif device == "cuda":
+                        cls = type(buffers[buffer_idx])
                         buffers[buffer_idx].reload_from_cpu(
                             move_params=move_params, move_grads=move_grads
                         )
