@@ -1,12 +1,12 @@
 [submodule "3rdparty/Megatron-LM"]
 	path = 3rdparty/Megatron-LM-workspace/Megatron-LM
-	url = https://github.com/terrykong/Megatron-LM.git
-	branch = yuya/nemo-rl-use-2
+	url = ssh://git@gitlab-master.nvidia.com:12051/yubog/megatron-lm.git
+	branch = yubog/training-moe-june2025-TP-GQA
 	shallow = true
 [submodule "3rdparty/Megatron-Bridge"]
 	path = 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
-	url = https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
-	branch = yifu/nemo-rl-use-nanov2
+	url = ssh://git@gitlab-master.nvidia.com:12051/yubog/Megatron-Bridge.git
+	branch = yubog/nemotron-next
 	shallow = true
 [submodule "3rdparty/Automodel-workspace/Automodel"]
 	path = 3rdparty/Automodel-workspace/Automodel
