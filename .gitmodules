@@ -1,9 +1,9 @@
-[submodule "3rdparty/Megatron-LM"]
+[submodule "3rdparty/Megatron-LM-workspace/Megatron-LM"]
 	path = 3rdparty/Megatron-LM-workspace/Megatron-LM
 	url = ssh://git@gitlab-master.nvidia.com:12051/yubog/megatron-lm.git
 	branch = yubog/training-moe-june2025-TP-GQA
 	shallow = true
-[submodule "3rdparty/Megatron-Bridge"]
+[submodule "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"]
 	path = 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
 	url = ssh://git@gitlab-master.nvidia.com:12051/yubog/Megatron-Bridge.git
 	branch = yubog/nemotron-next
