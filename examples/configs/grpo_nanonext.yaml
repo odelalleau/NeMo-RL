@@ -36,7 +36,7 @@ checkpointing:
 
 policy:
   # model_name: "Qwen/Qwen2.5-1.5B"
-  model_name: "/lustre/fs2/portfolios/llmservice/users/lvega/models/nano-v2.5-iter_0220000-bf16/"
+  model_name: "/lustre/fs2/portfolios/llmservice/users/lvega/models/3b_hybrid_moe/checkpoints/phase2/hf/iter_0993410"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
   train_global_batch_size: 512
