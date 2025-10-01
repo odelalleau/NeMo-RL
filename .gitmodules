@@ -6,7 +6,7 @@
 [submodule "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"]
 	path = 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
 	url = ssh://git@gitlab-master.nvidia.com:12051/yubog/Megatron-Bridge.git
-	branch = yubog/nemotron-next
+	branch = yifu/nano-v3
 	shallow = true
 [submodule "3rdparty/Automodel-workspace/Automodel"]
 	path = 3rdparty/Automodel-workspace/Automodel
