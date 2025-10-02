@@ -22,7 +22,7 @@ checkpointing:
   checkpoint_must_save_by: null
 
 policy:
-  model_name: "/lustre/fs2/portfolios/llmservice/users/lvega/models/nano-v2.5-iter_0220000-bf16/"
+  model_name: "/lustre/fs2/portfolios/llmservice/users/lvega/models/3b_hybrid_moe/checkpoints/phase2/hf/iter_0993410"
   # model_name: "/lustre/fsw/portfolios/coreai/users/liding/nemo/workspace/experiments/nm6_training/3B_config2_1536batch_1T_decay_cp_flops/checkpoints/iter_0002000/"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
