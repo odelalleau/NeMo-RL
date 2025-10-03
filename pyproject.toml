@@ -78,10 +78,10 @@ mcore = [
     # This dependency also needs to be compatible with the spec in Megatron-Bridge/pyproject.toml.
     # It is specified here since we don't directly use Megatron-Bridge/pyproject.toml, but a proxy setup.py+pyproject.toml combo
     # outside to allow "optionally" installing the megatron path. It's simpler to deal with transformer-engine here in the NeMo RL pyproject.toml
-    # "transformer-engine[pytorch]==2.5.0", # change ybga#o
+    "transformer-engine[pytorch]==2.5.0", # change ybga#o
     # "transformer-engine[pytorch]>=2.6.0a0,<2.8.0",
-    "transformer-engine",
-    "transformer-engine-torch",
+    # "transformer-engine",
+    # "transformer-engine-torch",
     "megatron-core",
     "megatron-bridge",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved

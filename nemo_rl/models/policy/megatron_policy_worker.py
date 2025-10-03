@@ -61,12 +61,12 @@ from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.bridge.utils.instantiate_utils import InstantiationMode
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel
-# from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
-#     FullyShardedDataParallel as custom_FSDP,
-# )
-from megatron.core.distributed.custom_fsdp import (
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallel as custom_FSDP,
-)   # ybgao
+)
+# from megatron.core.distributed.custom_fsdp import (
+#     FullyShardedDataParallel as custom_FSDP,
+# )   # ybgao
 from megatron.core.inference.engines import (
     StaticInferenceEngine,
 )
