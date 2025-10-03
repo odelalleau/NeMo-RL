@@ -282,9 +282,9 @@ def setup_megatron_model(
         overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
         data_parallel_random_init=cfg.rng.data_parallel_random_init,
         pre_wrap_hook=pre_wrap_hook,
-        # wrap_cast_model_output_to_fp32=(   # ybgao
-        #     not policy_cfg["megatron_cfg"].get("defer_fp32_logits", None)
-        # ),
+        wrap_cast_model_output_to_fp32=(   # ybgao
+            not policy_cfg["megatron_cfg"].get("defer_fp32_logits", None)
+        ),
     )
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(
@@ -721,9 +721,9 @@ class MegatronPolicyWorker:
                 use_torch_fsdp2=self.megatron_cfg.dist.use_torch_fsdp2,
                 overlap_param_gather_with_optimizer_step=self.megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
                 pre_wrap_hook=self.megatron_cfg.rng.data_parallel_random_init,
-                # wrap_cast_model_output_to_fp32=(
-                #     not self.cfg["megatron_cfg"].get("defer_fp32_logits", None)
-                # ),
+                wrap_cast_model_output_to_fp32=(
+                    not self.cfg["megatron_cfg"].get("defer_fp32_logits", None)
+                ),
             )
             print("Loading the Reference Model")
             if (
