@@ -1122,6 +1122,30 @@ def grpo_train(
                 log_data, f"train_data_step{total_steps}.jsonl"
             )
 
+            # Log a representative sample (prompt, response, reward) to wandb table if enabled
+            sample_prompt = ""
+            sample_response = ""
+            sample_reward = float(rewards[0].detach().cpu().item()) if torch.is_tensor(rewards) else float(rewards[0])
+            
+            if "message_log" in repeated_batch and len(repeated_batch["message_log"]) > 0:
+                # Extract prompt and response using existing helper
+                sample_messages = get_keys_from_message_log(
+                    repeated_batch["message_log"][0], ["role", "content"]
+                )
+                for msg in sample_messages:
+                    if msg["role"] == "user" and not sample_prompt:
+                        sample_prompt = msg["content"]
+                    elif msg["role"] == "assistant" and not sample_response:
+                        sample_response = msg["content"]
+
+            logger.log_sample_to_table(
+                table_name="train/sample",
+                step=total_steps + 1,
+                prompt=sample_prompt,
+                response=sample_response,
+                reward=sample_reward,
+            )
+
             metrics = {
                 "loss": train_results["loss"].numpy(),
                 "reward": rewards.numpy(),

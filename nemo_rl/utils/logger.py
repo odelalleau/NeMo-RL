@@ -155,6 +155,7 @@ class WandbLogger(LoggerInterface):
         print(
             f"Initialized WandbLogger for project {cfg.get('project')}, run {cfg.get('name')} at {log_dir}"
         )
+        self._tables: dict[str, wandb.Table] = {}
 
     def _log_diffs(self):
         """Log git diffs to wandb.
@@ -322,6 +323,27 @@ class WandbLogger(LoggerInterface):
             step: Global step value
         """
         self.run.log({name: figure}, step=step)
+
+    def log_sample_to_table(
+        self,
+        table_name: str,
+        step: int,
+        prompt: str,
+        response: str,
+        reward: float,
+    ) -> None:
+        """Log a sample consisting of prompt, response, and reward to a wandb table."""
+
+        if table_name not in self._tables:
+            self._tables[table_name] = wandb.Table(
+                columns=["step", "prompt", "response", "reward"]
+            )
+
+        table = self._tables[table_name]
+        table.add_data(step, prompt, response, reward)
+
+        # Log the updated table. Using commit=False allows multiple logs per step if needed.
+        self.run.log({table_name: table}, step=step, commit=False)
 
 
 class GpuMetricSnapshot(TypedDict):
@@ -926,6 +948,27 @@ class Logger(LoggerInterface):
             logger.log_plot(fig, step, name)
 
         plt.close(fig)
+
+    def log_sample_to_table(
+        self,
+        table_name: str,
+        step: int,
+        prompt: str,
+        response: str,
+        reward: float,
+    ) -> None:
+        """Log a single sample (prompt, response, reward) to a wandb table if enabled."""
+
+        if self.wandb_logger is None:
+            return
+
+        self.wandb_logger.log_sample_to_table(
+            table_name=table_name,
+            step=step,
+            prompt=prompt,
+            response=response,
+            reward=reward,
+        )
 
     def __del__(self) -> None:
         """Clean up resources when the logger is destroyed."""
