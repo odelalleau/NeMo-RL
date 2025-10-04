@@ -13,9 +13,11 @@
 # limitations under the License.
 import os
 import warnings
+import math
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
+from typing import Any, Dict, NotRequired, Optional, Tuple, TypedDict, TypeVar, cast
+from itertools import combinations
 
 import numpy as np
 import ray
@@ -88,6 +90,11 @@ class GRPOConfig(TypedDict):
     max_val_samples: int
     seed: int
     overlong_filtering: NotRequired[bool]
+    # Best@k training configuration
+    use_best_at_k: NotRequired[bool]  # Enable Best@k training
+    best_at_k_k: NotRequired[int]  # k value for Best@k (number of samples per group)
+    best_at_k_m: NotRequired[int]  # m value for Best@k (number of bootstrap groups)
+    use_combined_training: NotRequired[bool]  # Enable combined Best@k + Pass@1 training with adaptive weighting
 
 
 class GRPOSaveState(TypedDict):
@@ -413,6 +420,149 @@ def setup(
 # ===============================================================================
 
 
+def calculate_best_at_k_advantages_bootstrap(
+    rewards: torch.Tensor,
+    num_prompts: int,
+    num_generations_per_prompt: int,
+    k: int,
+    m: int,
+    normalize: bool = False,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """Calculate Best@k advantages using bootstrap sampling.
+    
+    Args:
+        rewards: Tensor of shape (num_prompts * num_generations_per_prompt,) containing rewards
+        num_prompts: Number of original prompts
+        num_generations_per_prompt: Number of generations per prompt (n)
+        k: Number of samples to select in each group
+        m: Number of bootstrap groups to create
+        normalize: Whether to normalize advantages
+        
+    Returns:
+        Tuple of (advantages, metrics) where advantages has same shape as rewards
+    """
+    # Validate k
+    if k > num_generations_per_prompt:
+        raise ValueError(f"k ({k}) cannot be greater than num_generations_per_prompt ({num_generations_per_prompt})")
+    
+    # Calculate maximum possible unique groups
+    max_unique_groups = math.comb(num_generations_per_prompt, k)
+    
+    # Decide sampling strategy
+    use_all_combinations = max_unique_groups <= m
+    effective_m = max_unique_groups if use_all_combinations else m
+    
+    if use_all_combinations:
+        print(f"    Using all C({num_generations_per_prompt},{k})={max_unique_groups} unique combinations (< m={m})")
+    else:
+        print(f"    Bootstrap sampling m={m} groups from C({num_generations_per_prompt},{k})={max_unique_groups} possible combinations")
+    
+    # Reshape rewards to (num_prompts, num_generations_per_prompt)
+    rewards_by_prompt = rewards.view(num_prompts, num_generations_per_prompt)
+    
+    # Initialize advantages with zeros
+    advantages = torch.zeros_like(rewards, dtype=torch.float32)
+    
+    # Metrics to track
+    group_rewards_all = []
+    
+    # Process each prompt separately
+    for prompt_idx in range(num_prompts):
+        prompt_rewards = rewards_by_prompt[prompt_idx]
+        prompt_advantages = torch.zeros(num_generations_per_prompt, dtype=torch.float32)
+        
+        # Track which groups each sample belongs to
+        sample_group_memberships = [[] for _ in range(num_generations_per_prompt)]
+        group_rewards = []
+        
+        if use_all_combinations:
+            # Generate all unique combinations
+            all_indices = list(range(num_generations_per_prompt))
+            all_combinations = list(combinations(all_indices, k))
+            
+            for group_idx, sampled_indices in enumerate(all_combinations):
+                sampled_indices_tensor = torch.tensor(sampled_indices, dtype=torch.long)
+                
+                # Get the best reward in this group
+                group_reward = prompt_rewards[sampled_indices_tensor].max().item()
+                group_rewards.append(group_reward)
+                
+                # Track which samples are in this group
+                for idx in sampled_indices:
+                    sample_group_memberships[idx].append(group_idx)
+        else:
+            # Original bootstrap sampling with duplicate detection
+            seen_combinations = set()
+            actual_groups_created = 0
+            attempts = 0
+            max_attempts = m * 3  # Prevent infinite loop
+            
+            while actual_groups_created < m and attempts < max_attempts:
+                attempts += 1
+                
+                # Randomly sample k indices without replacement
+                sampled_indices = torch.randperm(num_generations_per_prompt)[:k]
+                
+                # Check if we've seen this combination before
+                indices_tuple = tuple(sorted(sampled_indices.tolist()))
+                if indices_tuple in seen_combinations:
+                    continue
+                seen_combinations.add(indices_tuple)
+                
+                # Get the best reward in this group
+                group_reward = prompt_rewards[sampled_indices].max().item()
+                group_rewards.append(group_reward)
+                
+                # Track which samples are in this group
+                for idx in sampled_indices:
+                    sample_group_memberships[idx.item()].append(actual_groups_created)
+                
+                actual_groups_created += 1
+        
+        # Calculate baseline and advantages for groups
+        group_rewards_tensor = torch.tensor(group_rewards, dtype=torch.float32)
+        group_baseline = group_rewards_tensor.mean()
+        group_advantages = group_rewards_tensor - group_baseline
+        
+        # Normalize group advantages if requested
+        if normalize:
+            group_std = group_rewards_tensor.std()
+            if group_std > 0:
+                group_advantages = group_advantages / group_std
+        
+        # Assign advantages to samples based on their group memberships
+        for sample_idx in range(num_generations_per_prompt):
+            if sample_group_memberships[sample_idx]:
+                # Sum advantages from all groups this sample belongs to
+                sample_advantage = sum(
+                    group_advantages[group_idx].item() 
+                    for group_idx in sample_group_memberships[sample_idx]
+                )
+                prompt_advantages[sample_idx] = sample_advantage
+        
+        # Store advantages for this prompt
+        start_idx = prompt_idx * num_generations_per_prompt
+        end_idx = start_idx + num_generations_per_prompt
+        advantages[start_idx:end_idx] = prompt_advantages
+        
+        group_rewards_all.extend(group_rewards)
+    
+    # Calculate metrics
+    metrics = {
+        "best_at_k_mean_group_reward": np.mean(group_rewards_all),
+        "best_at_k_std_group_reward": np.std(group_rewards_all),
+        "best_at_k_min_group_reward": np.min(group_rewards_all),
+        "best_at_k_max_group_reward": np.max(group_rewards_all),
+        "best_at_k_k": k,
+        "best_at_k_m": m,
+        "best_at_k_effective_m": effective_m,
+        "best_at_k_max_unique_groups": max_unique_groups,
+        "best_at_k_used_all_combinations": use_all_combinations,
+    }
+    
+    return advantages.unsqueeze(-1), metrics
+
+
 def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     """Determine if async rollouts should be used based on the configuration.
 
@@ -663,23 +813,129 @@ def grpo_train(
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
 
-                    print("▶ Computing advantages...", flush=True)
-                    baseline, std = calculate_baseline_and_std_per_prompt(
-                        input_ids,
-                        rewards,
-                        torch.ones_like(rewards),
-                        leave_one_out_baseline=master_config["grpo"][
-                            "use_leave_one_out_baseline"
-                        ],
-                    )
-                    advantages = (rewards - baseline).unsqueeze(-1)
+                    # Compute Pass@R metric (R = num_generations_per_prompt)
+                    num_generations = master_config["grpo"]["num_generations_per_prompt"]
+                    num_prompts_for_metric = master_config["grpo"]["num_prompts_per_step"]
+                    rewards_matrix = rewards.reshape(num_prompts_for_metric, num_generations)
+                    pass_at_r_metric = (rewards_matrix > 0).any(dim=1).float().mean().item()
+                    
+                    # Compute percentage of prompts with non-zero advantage (variance in rewards)
+                    prompts_with_variance = (rewards_matrix.std(dim=1) > 0).float().mean().item()
 
-                    if master_config["grpo"]["normalize_rewards"]:
-                        # don't sharpen the ones with no variation
-                        zero_std_mask = std > 0
-                        advantages[zero_std_mask] = (
-                            advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
+                    print("▶ Computing advantages...", flush=True)
+                    
+                    use_combined = master_config["grpo"].get("use_combined_training", False)
+                    use_best_at_k = master_config["grpo"].get("use_best_at_k", False)
+                    
+                    # Combined training: blend Best@k and Pass@1 advantages
+                    if use_combined:
+                        print("    Using Combined Training (Best@k + Pass@1 with adaptive weighting)...")
+                        k = master_config["grpo"]["best_at_k_k"]
+                        m = master_config["grpo"]["best_at_k_m"]
+                        
+                        # Calculate Best@k advantages
+                        best_at_k_advantages, best_at_k_metrics = calculate_best_at_k_advantages_bootstrap(
+                            rewards=rewards,
+                            num_prompts=master_config["grpo"]["num_prompts_per_step"],
+                            num_generations_per_prompt=master_config["grpo"]["num_generations_per_prompt"],
+                            k=k,
+                            m=m,
+                            normalize=master_config["grpo"]["normalize_rewards"],
                         )
+                        
+                        # Calculate percentage of prompts with non-zero Best@k advantages
+                        # (prompts where not all responses have zero advantage)
+                        best_at_k_advantages_matrix = best_at_k_advantages.squeeze(-1).view(num_prompts_for_metric, num_generations)
+                        prompts_with_nonzero_best_at_k_adv = (best_at_k_advantages_matrix.abs().max(dim=1)[0] > 1e-6).float().mean().item()
+                        best_at_k_metrics["prompts_with_nonzero_best_at_k_adv_pct"] = prompts_with_nonzero_best_at_k_adv
+                        
+                        # Calculate standard Pass@1 advantages
+                        baseline, std = calculate_baseline_and_std_per_prompt(
+                            input_ids,
+                            rewards,
+                            torch.ones_like(rewards),
+                            leave_one_out_baseline=master_config["grpo"]["use_leave_one_out_baseline"],
+                        )
+                        normal_advantages = (rewards - baseline).unsqueeze(-1)
+                        if master_config["grpo"]["normalize_rewards"]:
+                            zero_std_mask = std > 0
+                            normal_advantages[zero_std_mask] = (
+                                normal_advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
+                            )
+                        
+                        # Compute adaptive weights based on correctness rate per prompt
+                        # N_pos = number of correct responses (reward > 0) per prompt
+                        n_pos_per_prompt = (rewards_matrix > 0).sum(dim=1).float()  # Shape: (num_prompts,)
+                        correctness_rate = n_pos_per_prompt / num_generations  # Shape: (num_prompts,)
+                        
+                        # Expand to match advantages shape: (num_prompts * num_generations, 1)
+                        best_at_k_weight = correctness_rate.repeat_interleave(num_generations).unsqueeze(-1)
+                        pass_at_1_weight = 1.0 - best_at_k_weight
+                        
+                        # Blend advantages
+                        advantages = best_at_k_weight * best_at_k_advantages + pass_at_1_weight * normal_advantages
+
+                        # Track average weights for logging/monitoring
+                        mean_best_at_k_weight = best_at_k_weight.mean().item()
+                        best_at_k_metrics["combined_mean_best_at_k_weight"] = mean_best_at_k_weight
+                        best_at_k_metrics["combined_mean_pass_at_1_weight"] = 1.0 - mean_best_at_k_weight
+
+                        print(f"    Best@k: k={k}, m={m}, mean_group_reward={best_at_k_metrics['best_at_k_mean_group_reward']:.4f}")
+                        print(
+                            f"    Mean weight → Best@k: {mean_best_at_k_weight:.4f}, Pass@1: {1.0 - mean_best_at_k_weight:.4f}"
+                        )
+                        if best_at_k_metrics['best_at_k_used_all_combinations']:
+                            print(f"    ✓ Used all {best_at_k_metrics['best_at_k_effective_m']} unique combinations")
+                        else:
+                            print(f"    • Sampled {best_at_k_metrics['best_at_k_effective_m']} groups")
+                    
+                    # Pure Best@k training
+                    elif use_best_at_k:
+                        print("    Using Best@k bootstrap sampling...")
+                        k = master_config["grpo"]["best_at_k_k"]
+                        m = master_config["grpo"]["best_at_k_m"]
+                        
+                        advantages, best_at_k_metrics = calculate_best_at_k_advantages_bootstrap(
+                            rewards=rewards,
+                            num_prompts=master_config["grpo"]["num_prompts_per_step"],
+                            num_generations_per_prompt=master_config["grpo"]["num_generations_per_prompt"],
+                            k=k,
+                            m=m,
+                            normalize=master_config["grpo"]["normalize_rewards"],
+                        )
+                        
+                        # Calculate percentage of prompts with non-zero Best@k advantages
+                        # (prompts where not all responses have zero advantage)
+                        best_at_k_advantages_matrix = advantages.squeeze(-1).view(num_prompts_for_metric, num_generations)
+                        prompts_with_nonzero_best_at_k_adv = (best_at_k_advantages_matrix.abs().max(dim=1)[0] > 1e-6).float().mean().item()
+                        best_at_k_metrics["prompts_with_nonzero_best_at_k_adv_pct"] = prompts_with_nonzero_best_at_k_adv
+                        
+                        print(f"    Best@k: k={k}, m={m}, mean_group_reward={best_at_k_metrics['best_at_k_mean_group_reward']:.4f}")
+                        print(f"    Max unique groups: C({master_config['grpo']['num_generations_per_prompt']},{k})={best_at_k_metrics['best_at_k_max_unique_groups']}")
+                        if best_at_k_metrics['best_at_k_used_all_combinations']:
+                            print(f"    ✓ Used all {best_at_k_metrics['best_at_k_effective_m']} unique combinations")
+                        else:
+                            print(f"    • Sampled {best_at_k_metrics['best_at_k_effective_m']} groups")
+                    
+                    # Standard Pass@1 training
+                    else:
+                        # Original baseline calculation
+                        baseline, std = calculate_baseline_and_std_per_prompt(
+                            input_ids,
+                            rewards,
+                            torch.ones_like(rewards),
+                            leave_one_out_baseline=master_config["grpo"][
+                                "use_leave_one_out_baseline"
+                            ],
+                        )
+                        advantages = (rewards - baseline).unsqueeze(-1)
+
+                        if master_config["grpo"]["normalize_rewards"]:
+                            # don't sharpen the ones with no variation
+                            zero_std_mask = std > 0
+                            advantages[zero_std_mask] = (
+                                advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
+                            )
 
                 with timer.time("data_processing"):
                     use_overlong_filtering = master_config["grpo"]["overlong_filtering"]
@@ -887,6 +1143,15 @@ def grpo_train(
                 else:
                     metrics[k] = np.sum(v).item()
             metrics.update(rollout_metrics)
+            
+            # Add Best@k metrics if they were calculated
+            if master_config["grpo"].get("use_best_at_k", False) or master_config["grpo"].get("use_combined_training", False):
+                metrics.update(best_at_k_metrics)
+
+            # Log Pass@R metric (R = num_generations_per_prompt)
+            metrics[f"pass_at_{num_generations}"] = pass_at_r_metric
+            # Log percentage of prompts with variance in rewards (based on original rewards)
+            metrics["prompts_with_reward_variance_pct"] = prompts_with_variance
 
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"
