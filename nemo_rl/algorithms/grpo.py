@@ -95,6 +95,11 @@ class GRPOConfig(TypedDict):
     best_at_k_k: NotRequired[int]  # k value for Best@k (number of samples per group)
     best_at_k_m: NotRequired[int]  # m value for Best@k (number of bootstrap groups)
     use_combined_training: NotRequired[bool]  # Enable combined Best@k + Pass@1 training with adaptive weighting
+    combined_training_weight_mode: NotRequired[str]  # "auto" for adaptive weighting, or "fixed" to use custom weights
+    combined_training_best_at_k_weight: NotRequired[float]  # Weight for Best@k (used when mode is "fixed")
+    combined_training_pass_at_1_weight: NotRequired[float]  # Weight for Pass@1 (used when mode is "fixed")
+    # Dynamic sampling configuration
+    dynamic_sampling_oversample_ratio: NotRequired[float]  # Ratio of prompts to load (default 1.0, >1 enables dynamic sampling, e.g., 2.0 for 2x)
 
 
 class GRPOSaveState(TypedDict):
@@ -196,9 +201,13 @@ def setup(
     # ==========================
     #           Data
     # ==========================
+    # Adjust batch size for dynamic sampling if oversample ratio > 1
+    oversample_ratio = grpo_config.get("dynamic_sampling_oversample_ratio", 1.0)
+    actual_batch_size = int(grpo_config["num_prompts_per_step"] * oversample_ratio)
+    
     dataloader = StatefulDataLoader(
         dataset,
-        batch_size=grpo_config["num_prompts_per_step"],
+        batch_size=actual_batch_size,
         shuffle=data_config["shuffle"],
         collate_fn=rl_collate_fn,
         drop_last=True,
@@ -418,6 +427,74 @@ def setup(
 # ===============================================================================
 # Core Algorithm Functions
 # ===============================================================================
+
+
+def filter_prompts_by_training_signal(
+    rewards: torch.Tensor,
+    advantages: torch.Tensor,
+    repeated_batch: BatchedDataDict,
+    num_prompts: int,
+    num_generations_per_prompt: int,
+    target_num_prompts: int,
+) -> Tuple[torch.Tensor, torch.Tensor, BatchedDataDict, torch.Tensor]:
+    """Filter prompts by prioritizing those with non-zero advantages.
+    
+    Selects prompts where not all response advantages are zero (indicating training signal).
+    If there aren't enough prompts with signal, fills the remaining slots with prompts
+    without signal to ensure we always return exactly target_num_prompts.
+    
+    Args:
+        rewards: Tensor of shape (num_prompts * num_generations_per_prompt,)
+        advantages: Tensor of shape (num_prompts * num_generations_per_prompt, 1)
+        repeated_batch: Batch data dict with all prompts
+        num_prompts: Total number of prompts loaded
+        num_generations_per_prompt: Number of generations per prompt
+        target_num_prompts: Target number of prompts to keep after filtering
+        
+    Returns:
+        Tuple of (filtered_rewards, filtered_advantages, filtered_batch, selected_indices)
+    """
+    # Find prompts where not all advantages are zero (have training signal)
+    advantages_by_prompt = advantages.view(num_prompts, num_generations_per_prompt, -1)
+    has_signal = advantages_by_prompt.abs().amax(dim=(1, 2)) > 1e-8
+    
+    # Get indices of prompts with and without signal
+    with_signal = torch.where(has_signal)[0]
+    without_signal = torch.where(~has_signal)[0]
+    
+    # Select prompts: prioritize those with signal, fill with those without if needed
+    if len(with_signal) >= target_num_prompts:
+        selected_indices = with_signal[torch.randperm(len(with_signal))[:target_num_prompts]]
+    else:
+        # Use all with signal, fill remainder with those without
+        num_filler = min(target_num_prompts - len(with_signal), len(without_signal))
+        filler = without_signal[torch.randperm(len(without_signal))[:num_filler]] if num_filler > 0 else torch.tensor([], dtype=torch.long)
+        selected_indices = torch.cat([with_signal, filler])
+    
+    # Sort for consistent ordering
+    selected_indices = selected_indices.sort()[0]
+    
+    # Create flat indices for all generations of selected prompts
+    flat_indices = torch.cat([
+        torch.arange(idx * num_generations_per_prompt, (idx + 1) * num_generations_per_prompt)
+        for idx in selected_indices
+    ]).long()
+    
+    # Filter rewards and advantages
+    filtered_rewards = rewards[flat_indices]
+    filtered_advantages = advantages[flat_indices]
+    
+    # Filter batch data
+    filtered_batch = BatchedDataDict({
+        key: (
+            value[flat_indices] if isinstance(value, torch.Tensor) and value.shape[0] == rewards.shape[0]
+            else [value[i] for i in flat_indices.tolist()] if isinstance(value, list) and len(value) == rewards.shape[0]
+            else value
+        )
+        for key, value in repeated_batch.items()
+    })
+    
+    return filtered_rewards, filtered_advantages, filtered_batch, selected_indices
 
 
 def calculate_best_at_k_advantages_bootstrap(
@@ -671,7 +748,23 @@ def grpo_train(
     master_config: MasterConfig,
     processor: Optional[AutoProcessor] = None,
 ) -> None:
-    """Run GRPO training algorithm."""
+    """Run GRPO training algorithm.
+    
+    Dynamic Sampling:
+    When oversample_ratio > 1.0, the algorithm loads more prompts than needed (e.g., 2x) 
+    and prioritizes prompts with training signal. This improves training efficiency 
+    by focusing on prompts where different generations produce varied outcomes.
+    
+    The filtering happens after advantage calculation and works with all training modes:
+    - Normal training (Pass@1)
+    - Best@k training
+    - Combined training (Best@k + Pass@1)
+    
+    Selection strategy:
+    1. Randomly sample from prompts where not all advantages are zero (have gradient signal)
+    2. If fewer than target, fill remaining slots with prompts without signal
+    3. Always maintains target batch size for stable training
+    """
     timer = Timer()
     timeout = TimeoutChecker(
         timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
@@ -738,6 +831,10 @@ def grpo_train(
             if policy != policy_generation:
                 maybe_gpu_profile_step(policy_generation, total_steps + 1)
             val_metrics, validation_timings = None, None
+            
+            # Initialize dynamic sampling variables
+            oversample_ratio = master_config["grpo"].get("dynamic_sampling_oversample_ratio", 1.0)
+            actual_num_prompts = master_config["grpo"]["num_prompts_per_step"]  # Default value, will be updated if oversampling is used
 
             with timer.time("total_step_time"):
                 # Prepare batch
@@ -813,30 +910,41 @@ def grpo_train(
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
 
-                    # Compute Pass@R metric (R = num_generations_per_prompt)
+                    # Determine actual number of prompts loaded (for dynamic sampling)
                     num_generations = master_config["grpo"]["num_generations_per_prompt"]
-                    num_prompts_for_metric = master_config["grpo"]["num_prompts_per_step"]
-                    rewards_matrix = rewards.reshape(num_prompts_for_metric, num_generations)
+                    target_num_prompts = master_config["grpo"]["num_prompts_per_step"]
+                    
+                    if oversample_ratio > 1.0:
+                        actual_num_prompts = len(rewards) // num_generations
+                        print(f"    Dynamic sampling: loaded {actual_num_prompts} prompts, target {target_num_prompts}")
+                    # else: actual_num_prompts already set to target_num_prompts at initialization
+                    
+                    # Compute Pass@R metric (R = num_generations_per_prompt) - before filtering
+                    rewards_matrix = rewards.reshape(actual_num_prompts, num_generations)
                     pass_at_r_metric = (rewards_matrix > 0).any(dim=1).float().mean().item()
                     
-                    # Compute percentage of prompts with non-zero advantage (variance in rewards)
+                    # Compute percentage of prompts with non-zero advantage (variance in rewards) - before filtering
                     prompts_with_variance = (rewards_matrix.std(dim=1) > 0).float().mean().item()
 
                     print("▶ Computing advantages...", flush=True)
                     
                     use_combined = master_config["grpo"].get("use_combined_training", False)
                     use_best_at_k = master_config["grpo"].get("use_best_at_k", False)
+                    best_at_k_metrics = {}  # Initialize to empty dict, will be populated if needed
                     
                     # Combined training: blend Best@k and Pass@1 advantages
                     if use_combined:
-                        print("    Using Combined Training (Best@k + Pass@1 with adaptive weighting)...")
+                        weight_mode = master_config["grpo"].get("combined_training_weight_mode", "auto")
+                        is_auto_weight = weight_mode == "auto"
+                        
+                        print(f"    Using Combined Training (Best@k + Pass@1 with {'adaptive' if is_auto_weight else 'fixed'} weighting)...")
                         k = master_config["grpo"]["best_at_k_k"]
                         m = master_config["grpo"]["best_at_k_m"]
                         
-                        # Calculate Best@k advantages
+                        # Calculate Best@k advantages (using actual_num_prompts for dynamic sampling)
                         best_at_k_advantages, best_at_k_metrics = calculate_best_at_k_advantages_bootstrap(
                             rewards=rewards,
-                            num_prompts=master_config["grpo"]["num_prompts_per_step"],
+                            num_prompts=actual_num_prompts,
                             num_generations_per_prompt=master_config["grpo"]["num_generations_per_prompt"],
                             k=k,
                             m=m,
@@ -845,7 +953,7 @@ def grpo_train(
                         
                         # Calculate percentage of prompts with non-zero Best@k advantages
                         # (prompts where not all responses have zero advantage)
-                        best_at_k_advantages_matrix = best_at_k_advantages.squeeze(-1).view(num_prompts_for_metric, num_generations)
+                        best_at_k_advantages_matrix = best_at_k_advantages.squeeze(-1).view(actual_num_prompts, num_generations)
                         prompts_with_nonzero_best_at_k_adv = (best_at_k_advantages_matrix.abs().max(dim=1)[0] > 1e-6).float().mean().item()
                         best_at_k_metrics["prompts_with_nonzero_best_at_k_adv_pct"] = prompts_with_nonzero_best_at_k_adv
                         
@@ -863,26 +971,32 @@ def grpo_train(
                                 normal_advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
                             )
                         
-                        # Compute adaptive weights based on correctness rate per prompt
-                        # N_pos = number of correct responses (reward > 0) per prompt
-                        n_pos_per_prompt = (rewards_matrix > 0).sum(dim=1).float()  # Shape: (num_prompts,)
-                        correctness_rate = n_pos_per_prompt / num_generations  # Shape: (num_prompts,)
-                        
-                        # Expand to match advantages shape: (num_prompts * num_generations, 1)
-                        best_at_k_weight = correctness_rate.repeat_interleave(num_generations).unsqueeze(-1)
-                        pass_at_1_weight = 1.0 - best_at_k_weight
+                        # Determine weights based on mode
+                        if is_auto_weight:
+                            # Adaptive weighting based on correctness rate per prompt
+                            n_pos_per_prompt = (rewards_matrix > 0).sum(dim=1).float()
+                            correctness_rate = n_pos_per_prompt / num_generations
+                            best_at_k_weight = correctness_rate.repeat_interleave(num_generations).unsqueeze(-1)
+                            pass_at_1_weight = 1.0 - best_at_k_weight
+                        else:
+                            # Fixed weighting from config
+                            best_at_k_w = master_config["grpo"]["combined_training_best_at_k_weight"]
+                            pass_at_1_w = master_config["grpo"]["combined_training_pass_at_1_weight"]
+                            best_at_k_weight = torch.full((len(rewards), 1), best_at_k_w, dtype=torch.float32)
+                            pass_at_1_weight = torch.full((len(rewards), 1), pass_at_1_w, dtype=torch.float32)
                         
                         # Blend advantages
                         advantages = best_at_k_weight * best_at_k_advantages + pass_at_1_weight * normal_advantages
 
                         # Track average weights for logging/monitoring
                         mean_best_at_k_weight = best_at_k_weight.mean().item()
+                        mean_pass_at_1_weight = pass_at_1_weight.mean().item()
                         best_at_k_metrics["combined_mean_best_at_k_weight"] = mean_best_at_k_weight
-                        best_at_k_metrics["combined_mean_pass_at_1_weight"] = 1.0 - mean_best_at_k_weight
+                        best_at_k_metrics["combined_mean_pass_at_1_weight"] = mean_pass_at_1_weight
 
                         print(f"    Best@k: k={k}, m={m}, mean_group_reward={best_at_k_metrics['best_at_k_mean_group_reward']:.4f}")
                         print(
-                            f"    Mean weight → Best@k: {mean_best_at_k_weight:.4f}, Pass@1: {1.0 - mean_best_at_k_weight:.4f}"
+                            f"    Weight → Best@k: {mean_best_at_k_weight:.4f}, Pass@1: {mean_pass_at_1_weight:.4f} ({weight_mode})"
                         )
                         if best_at_k_metrics['best_at_k_used_all_combinations']:
                             print(f"    ✓ Used all {best_at_k_metrics['best_at_k_effective_m']} unique combinations")
@@ -897,7 +1011,7 @@ def grpo_train(
                         
                         advantages, best_at_k_metrics = calculate_best_at_k_advantages_bootstrap(
                             rewards=rewards,
-                            num_prompts=master_config["grpo"]["num_prompts_per_step"],
+                            num_prompts=actual_num_prompts,  # Use actual_num_prompts for dynamic sampling
                             num_generations_per_prompt=master_config["grpo"]["num_generations_per_prompt"],
                             k=k,
                             m=m,
@@ -906,7 +1020,7 @@ def grpo_train(
                         
                         # Calculate percentage of prompts with non-zero Best@k advantages
                         # (prompts where not all responses have zero advantage)
-                        best_at_k_advantages_matrix = advantages.squeeze(-1).view(num_prompts_for_metric, num_generations)
+                        best_at_k_advantages_matrix = advantages.squeeze(-1).view(actual_num_prompts, num_generations)
                         prompts_with_nonzero_best_at_k_adv = (best_at_k_advantages_matrix.abs().max(dim=1)[0] > 1e-6).float().mean().item()
                         best_at_k_metrics["prompts_with_nonzero_best_at_k_adv_pct"] = prompts_with_nonzero_best_at_k_adv
                         
@@ -936,6 +1050,45 @@ def grpo_train(
                             advantages[zero_std_mask] = (
                                 advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
                             )
+                    
+                    # Dynamic sampling: filter prompts with low training signal
+                    if oversample_ratio > 1.0 and actual_num_prompts > target_num_prompts:
+                        print(f"\n▶ Applying dynamic sampling filter...")
+                        original_num_prompts = actual_num_prompts
+                        prompts_with_variance_before_filter = prompts_with_variance  # Save pre-filter value
+                        
+                        # Filter prompts based on training signal strength
+                        rewards, advantages, repeated_batch, selected_prompt_indices = filter_prompts_by_training_signal(
+                            rewards=rewards,
+                            advantages=advantages,
+                            repeated_batch=repeated_batch,
+                            num_prompts=actual_num_prompts,
+                            num_generations_per_prompt=num_generations,
+                            target_num_prompts=target_num_prompts,
+                        )
+                        
+                        # Update metrics after filtering
+                        num_selected = len(selected_prompt_indices)
+                        rewards_matrix = rewards.view(num_selected, num_generations)
+                        pass_at_r_metric = (rewards_matrix > 0).any(dim=1).float().mean().item()
+                        prompts_with_variance_after_filter = (rewards_matrix.std(dim=1) > 0).float().mean().item()
+                        prompts_with_variance = prompts_with_variance_after_filter  # Update main metric
+                        
+                        # Calculate filtering statistics
+                        num_filtered_out = original_num_prompts - num_selected
+                        filtering_rate = num_filtered_out / original_num_prompts
+                        
+                        # Count how many prompts with signal were included
+                        advantages_by_prompt_filtered = advantages.view(num_selected, num_generations, -1)
+                        max_abs_advantage_filtered = advantages_by_prompt_filtered.abs().max(dim=1)[0].max(dim=1)[0]
+                        num_with_signal = (max_abs_advantage_filtered > 1e-8).sum().item()
+                        num_without_signal = num_selected - num_with_signal
+                        
+                        print(f"    • Filtered {num_filtered_out}/{original_num_prompts} prompts ({filtering_rate:.1%} filtered)")
+                        print(f"    • Selected {num_selected} prompts: {num_with_signal} with signal, {num_without_signal} as filler")
+                        print(f"    • Reward variance: {prompts_with_variance_before_filter:.1%} → {prompts_with_variance_after_filter:.1%} (before → after filter)")
+                    elif oversample_ratio > 1.0 and actual_num_prompts <= target_num_prompts:
+                        print(f"\n▶ Dynamic sampling: Using all {actual_num_prompts} prompts (no filtering needed)")
 
                 with timer.time("data_processing"):
                     use_overlong_filtering = master_config["grpo"]["overlong_filtering"]
@@ -1048,7 +1201,11 @@ def grpo_train(
                     )
 
                 ## Checkpointing
-                consumed_samples += master_config["grpo"]["num_prompts_per_step"]
+                # For dynamic sampling, we actually consumed more samples than we trained on
+                if oversample_ratio > 1.0:
+                    consumed_samples += actual_num_prompts  # Count all prompts we loaded/processed
+                else:
+                    consumed_samples += master_config["grpo"]["num_prompts_per_step"]
                 timeout.mark_iteration()
 
                 should_save_by_step = (
@@ -1168,14 +1325,27 @@ def grpo_train(
                     metrics[k] = np.sum(v).item()
             metrics.update(rollout_metrics)
             
-            # Add Best@k metrics if they were calculated
-            if master_config["grpo"].get("use_best_at_k", False) or master_config["grpo"].get("use_combined_training", False):
-                metrics.update(best_at_k_metrics)
+            # Add Best@k metrics (will be non-empty only if Best@k or combined training was used)
+            metrics.update(best_at_k_metrics)
 
             # Log Pass@R metric (R = num_generations_per_prompt)
             metrics[f"pass_at_{num_generations}"] = pass_at_r_metric
-            # Log percentage of prompts with variance in rewards (based on original rewards)
+            # Log percentage of prompts with variance in rewards (after filtering if dynamic sampling is used)
             metrics["prompts_with_reward_variance_pct"] = prompts_with_variance
+            
+            # Add dynamic sampling metrics if enabled
+            if oversample_ratio > 1.0 and 'num_selected' in locals():
+                metrics["dynamic_sampling_oversample_ratio"] = oversample_ratio
+                metrics["dynamic_sampling_original_prompts"] = original_num_prompts
+                metrics["dynamic_sampling_retained_prompts"] = num_selected
+                metrics["dynamic_sampling_filtering_rate"] = filtering_rate
+                if 'num_with_signal' in locals():
+                    metrics["dynamic_sampling_prompts_with_signal"] = num_with_signal
+                    metrics["dynamic_sampling_prompts_without_signal"] = num_without_signal
+                if 'prompts_with_variance_before_filter' in locals():
+                    metrics["dynamic_sampling_pre_filter_reward_variance_pct"] = prompts_with_variance_before_filter
+                if 'prompts_with_variance_after_filter' in locals():
+                    metrics["dynamic_sampling_post_filter_reward_variance_pct"] = prompts_with_variance_after_filter
 
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"
