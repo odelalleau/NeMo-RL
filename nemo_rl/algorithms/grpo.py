@@ -1372,6 +1372,12 @@ def grpo_train(
             print(f" • Token Mult Prob Error: {metrics['token_mult_prob_error']:.4f}")
             print(
                 f"  • Mean Generation Length: {rollout_metrics['mean_gen_tokens_per_sample']:.4f}",
+            )
+            print(
+                f"  • Min Generation Length: {rollout_metrics['min_gen_tokens_per_sample']:.4f}",
+            )
+            print(
+                f"  • Max Generation Length: {rollout_metrics['max_gen_tokens_per_sample']:.4f}",
                 flush=True,
             )
             if "total_flops" in train_results:

@@ -515,6 +515,12 @@ def run_multi_turn_rollout(
         "mean_gen_tokens_per_sample": float(
             sample_assistant_token_counts.float().mean().item()
         ),
+        "min_gen_tokens_per_sample": float(
+            sample_assistant_token_counts.float().min().item()
+        ),
+        "max_gen_tokens_per_sample": float(
+            sample_assistant_token_counts.float().max().item()
+        ),
         "mean_env_tokens_per_sample": float(
             sample_env_token_counts.float().mean().item()
         ),
@@ -879,6 +885,12 @@ def run_async_multi_turn_rollout(
                 m["assistant_tokens"] for m in all_sample_metrics
             )
             / batch_size,
+            "min_gen_tokens_per_sample": min(
+                m["assistant_tokens"] for m in all_sample_metrics
+            ),
+            "max_gen_tokens_per_sample": max(
+                m["assistant_tokens"] for m in all_sample_metrics
+            ),
             "mean_env_tokens_per_sample": sum(
                 m["env_tokens"] for m in all_sample_metrics
             )
