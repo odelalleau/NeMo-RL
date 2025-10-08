@@ -344,8 +344,8 @@ def forward_step_arbitrary_loss(
 
     with straggler_timer:
         additional_kwargs = {}
-        # if packed_seq_params is not None:
-        #     additional_kwargs["packed_seq_params"] = packed_seq_params
+        if packed_seq_params is not None:
+            additional_kwargs["packed_seq_params"] = packed_seq_params
         output_tensor = model(
             input_ids_cp_sharded,
             position_ids,
