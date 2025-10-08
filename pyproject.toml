@@ -79,6 +79,7 @@ mcore = [
     # This dependency also needs to be compatible with the spec in Megatron-Bridge/pyproject.toml.
     # It is specified here since we don't directly use Megatron-Bridge/pyproject.toml, but a proxy setup.py+pyproject.toml combo
     # outside to allow "optionally" installing the megatron path. It's simpler to deal with transformer-engine here in the NeMo RL pyproject.toml
+    "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@e3908bf5bd0cc6265bcb225d15cd8c996d4759ef",
     "transformer-engine[pytorch]==2.5.0", # change ybga#o
     # "transformer-engine[pytorch]>=2.6.0a0,<2.8.0",
     # "transformer-engine",

@@ -576,6 +576,10 @@ class MegatronPolicyWorker:
         ]
 
         model_cfg.moe_permute_fusion = self.cfg["megatron_cfg"]["moe_permute_fusion"]
+        model_cfg.moe_enable_deepep = self.cfg["megatron_cfg"]["moe_enable_deepep"]
+        model_cfg.moe_token_dispatcher_type = self.cfg["megatron_cfg"]["moe_token_dispatcher_type"]
+        model_cfg.moe_aux_loss_coeff = self.cfg["megatron_cfg"]["moe_aux_loss_coeff"]
+        
         if "layernorm_epsilon" in self.cfg["megatron_cfg"]:
             model_cfg.layernorm_epsilon = self.cfg["megatron_cfg"]["layernorm_epsilon"]
 
