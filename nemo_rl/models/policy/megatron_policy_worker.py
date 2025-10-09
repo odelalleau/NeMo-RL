@@ -579,6 +579,7 @@ class MegatronPolicyWorker:
         model_cfg.moe_enable_deepep = self.cfg["megatron_cfg"]["moe_enable_deepep"]
         model_cfg.moe_token_dispatcher_type = self.cfg["megatron_cfg"]["moe_token_dispatcher_type"]
         model_cfg.moe_aux_loss_coeff = self.cfg["megatron_cfg"]["moe_aux_loss_coeff"]
+        model_cfg.moe_router_enable_expert_bias = self.cfg["megatron_cfg"]["moe_router_enable_expert_bias"]
         
         if "layernorm_epsilon" in self.cfg["megatron_cfg"]:
             model_cfg.layernorm_epsilon = self.cfg["megatron_cfg"]["layernorm_epsilon"]

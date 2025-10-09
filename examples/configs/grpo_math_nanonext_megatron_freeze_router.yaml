@@ -35,6 +35,9 @@ grpo:
   
   # Dynamic sampling: oversample prompts, keep only those with non-zero advantages
   dynamic_sampling_oversample_ratio: 1.0  # 1.0 = disabled, 2.0 = load 2x and filter, etc.
+  
+  # Sequence-level logprob error masking (optional)
+  seq_logprob_error_threshold: null  # Set to value >1.0 (e.g., 1.5) to enable masking
 
 loss_fn:
   reference_policy_kl_penalty: 0
@@ -102,6 +105,7 @@ policy:
     moe_enable_deepep: false 
     moe_token_dispatcher_type: "alltoall"
     moe_aux_loss_coeff: 1e-4
+    moe_router_enable_expert_bias: true
     #gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
     defer_fp32_logits: null
