@@ -26,6 +26,7 @@ from nemo_rl.data.datasets.response_datasets.openmathinstruct2 import (
 from nemo_rl.data.datasets.response_datasets.refcoco import RefCOCODataset
 from nemo_rl.data.datasets.response_datasets.response_dataset import ResponseDataset
 from nemo_rl.data.datasets.response_datasets.squad import SquadDataset
+from nemo_rl.data.datasets.response_datasets.skywork import SkyworkOR1Dataset
 from nemo_rl.data.datasets.utils import get_extra_kwargs
 
 
@@ -73,6 +74,9 @@ def load_response_dataset(data_config, seed: int = 42):
             "Loading agentica-org/DeepScaleR-Preview-Dataset for training and validation"
         )
         base_dataset: Any = DeepScalerDataset(seed=seed)
+    elif dataset_name == "Skywork":
+        print("Loading Skywork-OR1-RL-Data for training and validation")
+        base_dataset: Any = SkyworkOR1Dataset(seed=seed)
     # for vlm rl training
     elif dataset_name == "clevr-cogent":
         base_dataset: Any = CLEVRCoGenTDataset(
