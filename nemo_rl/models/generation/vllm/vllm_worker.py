@@ -287,7 +287,7 @@ class BaseVllmGenerationWorker:
                     # Allow failures gracefully
                     pass
 
-            _patch_vllm_sampler()
+            # _patch_vllm_sampler()
 
         except (ImportError, AttributeError):
             # vllm not installed or has a different structure, skipping patch.

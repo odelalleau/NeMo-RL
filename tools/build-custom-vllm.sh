@@ -22,14 +22,16 @@ REPO_ROOT="$(realpath "$SCRIPT_DIR/..")"
 DEFAULT_GIT_URL="https://github.com/yfw/vllm.git"
 DEFAULT_BRANCH="v0.10.2-base"
 # git merge-base --fork-point origin/main tags/v0.10.0
-DEFAULT_VLLM_COMMIT=e017120ed146cc3069d18428322d67881cb95e67 # use full commit hash from the main branch
+# DEFAULT_VLLM_COMMIT=e017120ed146cc3069d18428322d67881cb95e67 # use full commit hash from the main branch
+DEFAULT_VLLM_COMMIT=b8b302cde434df8c9289a2b465406b47ebab1c2d # use full commit hash from the main branch
 
 # Parse command line arguments
 GIT_URL=${1:-$DEFAULT_GIT_URL}
 BRANCH=${2:-$DEFAULT_BRANCH}
 # NOTE: VLLM_USE_PRECOMPILED=1 didn't always seem to work since the wheels were sometimes built against an incompatible torch/cuda combo.
 export VLLM_COMMIT=${3:-$DEFAULT_VLLM_COMMIT}
-export VLLM_PRECOMPILED_WHEEL_LOCATION="https://wheels.vllm.ai/${VLLM_COMMIT}/vllm-0.10.2-cp38-abi3-manylinux1_x86_64.whl"
+export VLLM_PRECOMPILED_WHEEL_LOCATION="https://github.com/vllm-project/vllm/releases/download/v0.11.0/vllm-0.11.0-cp38-abi3-manylinux1_x86_64.whl"
+# export VLLM_PRECOMPILED_WHEEL_LOCATION="https://wheels.vllm.ai/${VLLM_COMMIT}/vllm-0.10.2-cp38-abi3-manylinux1_x86_64.whl"
 
 BUILD_DIR=$(realpath "$SCRIPT_DIR/../3rdparty/vllm")
 if [[ -e "$BUILD_DIR" ]]; then
