@@ -13,6 +13,10 @@ grpo:
   max_val_samples: 256
   val_batch_size: 256
   seed: 42
+  async_grpo:
+    enabled: false # Set to true to enable async training mode
+    # Max age (in training steps) for trajectories used in training
+    max_trajectory_age_steps: 1
   
   # Best@k training configuration (optional - set use_best_at_k to true to enable)
   use_best_at_k: false  # Enable Best@k training to optimize for best reward among k samples
@@ -177,7 +181,7 @@ policy:
       precision: ${policy.precision}
       tensor_parallel_size: 2
       pipeline_parallel_size: 1
-      enable_expert_parallel: false
+      expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP
       gpu_memory_utilization: 0.5
       max_model_len: ${policy.max_total_sequence_length}
       # when enforce_eager is False, it is optional to set ++policy.generation.vllm_kwargs.compilation_config.use_inductor=False for better accuracy,
@@ -217,6 +221,7 @@ logger:
   tensorboard_enabled: false
   mlflow_enabled: false  # Disable MLflow logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
+  swanlab_enabled: false # Disable SwanLab logging
   wandb:
     project: "grpo-dev"
     name: "grpo-dev-logger"

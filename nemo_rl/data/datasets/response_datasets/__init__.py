@@ -74,7 +74,7 @@ def load_response_dataset(data_config, seed: int = 42):
             "Loading agentica-org/DeepScaleR-Preview-Dataset for training and validation"
         )
         base_dataset: Any = DeepScalerDataset(seed=seed)
-    elif dataset_name == "Skywork":
+    elif dataset_name == "Skywork-OR1":
         print("Loading Skywork-OR1-RL-Data for training and validation")
         base_dataset: Any = SkyworkOR1Dataset(seed=seed)
     # for vlm rl training
