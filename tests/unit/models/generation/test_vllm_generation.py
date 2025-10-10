@@ -33,7 +33,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
-    _maybe_correct_merged_tokens,
+    _replace_prefix_tokens,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
@@ -1225,66 +1225,134 @@ def test_vllm_http_server(cluster, tokenizer):
         )
 
 
-def test_VllmAsyncGenerationWorker_maybe_correct_merged_tokens(tokenizer):
+def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
     # This test assumes the tokenizer model is for the Qwen 3 family
+    eos_token_id = tokenizer.eos_token_id
+    assert eos_token_id == 151645
 
-    # [26951, 3834] and [94224] both detokenize to " skinny"
-    # Test super simple example of correcting the merged tokens
-    actual_result = _maybe_correct_merged_tokens(
+    data_fpath = Path(__file__).with_name(
+        "test_VllmAsyncGenerationWorker_replace_prefix_tokens_data.json"
+    )
+    with data_fpath.open() as f:
+        data = json.load(f)
+
+    og_model_token_ids = data["og_model_token_ids"]
+    model_token_ids = data["model_token_ids"]
+    template_token_ids = data["template_token_ids"]
+
+    og_model_str = tokenizer.decode(og_model_token_ids)
+    model_str = tokenizer.decode(model_token_ids)
+    template_str = tokenizer.decode(template_token_ids)
+    assert og_model_str == template_str
+    assert model_str != template_str
+
+    model_prefix_token_ids = og_model_token_ids[:-16]
+    assert model_prefix_token_ids[-1] == eos_token_id
+    template_prefix_token_ids = template_token_ids[:-16]
+    assert template_prefix_token_ids[-1] == eos_token_id
+    result = _replace_prefix_tokens(
         tokenizer=tokenizer,
-        reference_token_ids=[26951, 3834],
-        actual_token_ids=[94224],
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
     )
-    expected_result = [26951, 3834]
-    assert expected_result == actual_result
+    assert result == og_model_token_ids
 
-    actual_result = _maybe_correct_merged_tokens(
+    # no EOS
+    model_prefix_token_ids = og_model_token_ids[:-17]
+    assert model_prefix_token_ids[-1] != eos_token_id
+    template_prefix_token_ids = template_token_ids[:-16]
+    assert template_prefix_token_ids[-1] == eos_token_id
+    result = _replace_prefix_tokens(
         tokenizer=tokenizer,
-        reference_token_ids=[61830, 65],
-        actual_token_ids=[2435, 20828],
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
     )
-    expected_result = [61830, 65]
-    assert expected_result == actual_result
+    assert result == og_model_token_ids
 
-    actual_result = _maybe_correct_merged_tokens(
+    model_prefix_token_ids = og_model_token_ids[:-16]
+    assert model_prefix_token_ids[-1] == eos_token_id
+    # newline after EOS
+    template_prefix_token_ids = template_token_ids[:-15]
+    assert template_prefix_token_ids[-2] == eos_token_id
+    assert template_prefix_token_ids[-1] != eos_token_id
+    result = _replace_prefix_tokens(
         tokenizer=tokenizer,
-        reference_token_ids=[758, 12601],
-        actual_token_ids=[89038],
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
     )
-    expected_result = [758, 12601]
-    assert expected_result == actual_result
+    assert result == og_model_token_ids
 
-    # Test no-op
-    actual_result = _maybe_correct_merged_tokens(
+    # no EOS
+    model_prefix_token_ids = og_model_token_ids[:-17]
+    assert model_prefix_token_ids[-1] != eos_token_id
+    # newline after EOS
+    template_prefix_token_ids = template_token_ids[:-15]
+    assert template_prefix_token_ids[-2] == eos_token_id
+    assert template_prefix_token_ids[-1] != eos_token_id
+    result = _replace_prefix_tokens(
         tokenizer=tokenizer,
-        reference_token_ids=[26951, 3834],
-        actual_token_ids=[26951, 3834],
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
     )
-    expected_result = [26951, 3834]
+    assert result == og_model_token_ids
 
-    # Test sanity failure assert
-    with pytest.raises(
-        AssertionError, match="Found a non-monotonically increasing trajectory"
-    ):
-        _maybe_correct_merged_tokens(
-            tokenizer=tokenizer,
-            reference_token_ids=[26951, 26951, 26951, 26951],
-            actual_token_ids=[26951, 26951, 3834, 3834, 3834],
-        )
-
-    test_data_fpath = Path(__file__).with_name(
-        "maybe_correct_merged_tokens_test_data.json"
-    )
-    with test_data_fpath.open() as f:
-        test_data = json.load(f)
-
-    actual_result = _maybe_correct_merged_tokens(
+    model_prefix_token_ids = model_token_ids[:-16]
+    assert model_prefix_token_ids[-1] == eos_token_id
+    template_prefix_token_ids = template_token_ids[:-16]
+    assert template_prefix_token_ids[-1] == eos_token_id
+    result = _replace_prefix_tokens(
         tokenizer=tokenizer,
-        reference_token_ids=test_data["seen_token_ids"],
-        actual_token_ids=test_data["output_prompt_token_ids"],
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
     )
-    expected_result = test_data["expected_output"]
-    assert expected_result == actual_result
+    assert result == model_token_ids
+
+    # no EOS
+    model_prefix_token_ids = model_token_ids[:-17]
+    assert model_prefix_token_ids[-1] != eos_token_id
+    template_prefix_token_ids = template_token_ids[:-16]
+    assert template_prefix_token_ids[-1] == eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == model_token_ids
+
+    model_prefix_token_ids = model_token_ids[:-16]
+    assert model_prefix_token_ids[-1] == eos_token_id
+    # newline after EOS
+    template_prefix_token_ids = template_token_ids[:-15]
+    assert template_prefix_token_ids[-2] == eos_token_id
+    assert template_prefix_token_ids[-1] != eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == model_token_ids
+
+    # no EOS
+    model_prefix_token_ids = model_token_ids[:-17]
+    assert model_prefix_token_ids[-1] != eos_token_id
+    # newline after EOS
+    template_prefix_token_ids = template_token_ids[:-15]
+    assert template_prefix_token_ids[-2] == eos_token_id
+    assert template_prefix_token_ids[-1] != eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == model_token_ids
 
 
 @pytest.mark.asyncio
@@ -1331,8 +1399,8 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
 
     _wait_for_vllm_http_server_spinup(base_urls[0])
 
-    # Check that the re-tokenized ids are the same with the reference and different without the reference.
-    # WITHOUT reference token IDs
+    # Check that the re-tokenized ids are the same with the model and different without the model.
+    # WITHOUT model token IDs
     response = requests.post(url=f"{base_urls[0]}/../tokenize", json=body)
     actual_result = response.json()
     expected_result = {
@@ -1353,7 +1421,7 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
     }
     assert expected_result == actual_result
 
-    # WITH reference token IDs
+    # WITH model token IDs
     initial_tokenized_query_ids_prefix = [151644, 872, 198, *initial_tokenized_ids]
     initial_tokenized_query_ids = [
         *initial_tokenized_query_ids_prefix,
@@ -1363,11 +1431,11 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
         77091,
         198,
     ]
-    body_with_reference_token_ids = body | {
+    body_with_model_prefix_token_ids = body | {
         "required_prefix_token_ids": initial_tokenized_query_ids_prefix
     }
     response = requests.post(
-        url=f"{base_urls[0]}/../tokenize", json=body_with_reference_token_ids
+        url=f"{base_urls[0]}/../tokenize", json=body_with_model_prefix_token_ids
     )
     actual_result = response.json()
     expected_result = {
@@ -1380,7 +1448,7 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
 
     # Generate and check result
     response = requests.post(
-        url=f"{base_urls[0]}/chat/completions", json=body_with_reference_token_ids
+        url=f"{base_urls[0]}/chat/completions", json=body_with_model_prefix_token_ids
     )
     vllm_http_server_result = response.json()
     vllm_http_server_generated_token = vllm_http_server_result["choices"][0][
