@@ -1120,6 +1120,12 @@ def run_async_penguin_rollout(
     rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
         "gen_tokens_per_sample/mean"
     ]
+    rollout_metrics["min_gen_tokens_per_sample"] = rollout_metrics[
+        "gen_tokens_per_sample/min"
+    ]
+    rollout_metrics["max_gen_tokens_per_sample"] = rollout_metrics[
+        "gen_tokens_per_sample/max"
+    ]
 
     # Convert LLMMessageLogType to FlatMessagesType for generation
     input_batch_for_input_ids = BatchedDataDict[DatumSpec](
