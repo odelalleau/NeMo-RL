@@ -99,6 +99,10 @@ policy:
     moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
     moe_permute_fusion: true
+    moe_enable_deepep: false 
+    moe_token_dispatcher_type: "alltoall"
+    moe_aux_loss_coeff: 1e-4
+    moe_router_enable_expert_bias: true
     #gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
     defer_fp32_logits: null
@@ -192,6 +196,10 @@ policy:
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
       expose_http_server: true
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+
     vllm_kwargs:
       mamba_ssm_cache_dtype: "float32"
       compilation_config:
@@ -211,7 +219,7 @@ policy:
 data:
   train_jsonl_fpath: train.jsonl
   validation_jsonl_fpath: validation.jsonl
-  shuffle: true
+  shuffle: false
 
 env:
   should_use_penguin: true
@@ -219,12 +227,22 @@ env:
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
     - resources_servers/library_judge_math/configs/library_judge_math.yaml
+    - resources_servers/comp_coding/configs/comp_coding.yaml
+    - resources_servers/workbench/configs/workbench.yaml
+    - resources_servers/mcqa/configs/mcqa.yaml
+    - resources_servers/instruction_following/configs/instruction_following.yaml
     library_judge_math:
       resources_servers:
         library_judge_math:
           judge_model_server:
             name: policy_model
           should_use_judge: false
+    comp_coding:
+      resources_servers:
+        comp_coding:
+          num_processes: 16
+          unit_test_timeout_secs: 10
+          debug: false
 
 logger:
   log_dir: "logs"  # Base directory for all logs
