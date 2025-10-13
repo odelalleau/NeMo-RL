@@ -127,8 +127,8 @@ class VanillaGenRMWorker:
                 "parsing_success": parsing_success
             }
 
-        except Exception as e:
-            self.logger.error(f"Unexpected error parsing response: {e}")
+        except Exception:
+            self.logger.exception(f"Unexpected error parsing response:\n{response}\nError:")
             return {
                 "score_1": None,
                 "score_2": None,
