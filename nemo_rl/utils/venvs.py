@@ -159,6 +159,8 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
     Returns:
         str: Path to the python executable in the created virtual environment
     """
+    import sys
+    
     # Determine the number of alive Ray nodes
     nodes = [n for n in ray.nodes() if n.get("Alive", False)]
     num_nodes = len(nodes)
@@ -176,7 +178,16 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
         for i, _ in enumerate(nodes)
     ]
     # ensure setup runs on each node
-    paths = ray.get([actor for actor in actors])
+    try:
+        paths = ray.get([actor for actor in actors])
+    except (ray.exceptions.WorkerCrashedError, Exception) as e:
+        logger.error(f"Failed to create venv '{venv_name}': {e}")
+        try:
+            ray.util.remove_placement_group(pg)
+        except Exception:
+            pass
+        sys.exit(1)
+    
     # Normalize paths to handle double slashes and other path inconsistencies
     normalized_paths = [os.path.normpath(p) for p in paths]
     assert len(set(normalized_paths)) == 1, (

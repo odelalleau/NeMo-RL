@@ -355,6 +355,11 @@ class VllmGeneration(GenerationInterface):
         return results
 
     def _post_init(self):
+        import sys
+        import logging
+        
+        logger = logging.getLogger(__name__)
+        
         # Choose the appropriate method based on async_engine setting
         method_name = (
             "post_init_async" if self.cfg["vllm_cfg"]["async_engine"] else "post_init"
@@ -364,7 +369,11 @@ class VllmGeneration(GenerationInterface):
             method_name, run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"]
         )
         # Wait for all futures to complete
-        results = ray.get(futures)
+        try:
+            results = ray.get(futures)
+        except (ray.exceptions.ActorDiedError, ray.exceptions.RayTaskError) as e:
+            logger.error(f"vLLM worker initialization failed: {e}")
+            sys.exit(1)
         return results
 
     def init_collective(
