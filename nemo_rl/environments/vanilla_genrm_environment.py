@@ -71,8 +71,9 @@ class VanillaGenRMWorker:
         """
         try:
             # Try to find JSON in the response
+            response = response.strip()
             json_str = None
-            json_start = response.rfind("\n```json\n")
+            json_start = 0 if response.startswith("```json\n") else response.rfind("\n```json\n")
             if json_start >= 0:
                 json_end = response.rfind("\n```")
                 if json_end > json_start:
