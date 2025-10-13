@@ -71,39 +71,62 @@ class VanillaGenRMWorker:
         """
         try:
             # Try to find JSON in the response
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(0)
-                parsed = json.loads(json_str)
-                
-                score_1 = float(parsed.get("score_1"))
-                score_2 = float(parsed.get("score_2"))
-                ranking = float(parsed.get("ranking"))
-                
-                # Check if any required scores are None - if so, mark as parsing failure
-                parsing_success = (score_1 is not None and 
-                                 score_2 is not None and 
-                                 ranking is not None)
-                
-                return {
-                    "score_1": score_1,
-                    "score_2": score_2, 
-                    "ranking": ranking,
-                    "response_1_analysis": parsed.get("response_1_analysis", ""),
-                    "response_2_analysis": parsed.get("response_2_analysis", ""),
-                    "parsing_success": parsing_success
-                }
-            else:
-                self.logger.warning(f"No JSON found in response: {response[:200]}...")
-                return {
-                    "score_1": None,
-                    "score_2": None,
-                    "ranking": None,
-                    "response_1_analysis": "",
-                    "response_2_analysis": "",
-                    "parsing_success": False
-                }
-        
+            json_str = None
+            json_start = response.rfind("\n```json\n")
+            if json_start >= 0:
+                json_end = response.rfind("\n```")
+                if json_end > json_start:
+                    json_str = response[json_start + len("\n```json\n"):json_end].strip()
+            assert json_str
+            parsed = json.loads(json_str)
+            score_1 = int(parsed["response_1_analysis"]["quality"])
+            score_2 = int(parsed["response_2_analysis"]["quality"])
+            ranking = int(parsed["preference_ranking"])
+            
+            parsing_success = 1 <= score_1 <= 5 and 1 <= score_2 <= 5 and (1 <= ranking <= 6 or ranking == -1)
+            delta = score_1 - score_2
+            if ranking  == 1:
+                assert delta >= 2
+            elif ranking == 2:
+                assert delta in [1, 2]
+            elif ranking in [3, 4]:
+                assert delta in [-1, 0, 1]
+            elif ranking == 5:
+                assert delta in [-1, -2]
+            elif ranking == 6:
+                assert delta <= -2
+            elif ranking == -1:
+                assert score_1 <= 2 and score_2 <= 2
+            
+            for resp_idx in [1, 2]:
+                score = score_1 if resp_idx == 1 else score_2
+                aois = parsed[f"response_{resp_idx}_analysis"]["areas_for_improvement"]
+                strs = parsed[f"response_{resp_idx}_analysis"]["strengths"]
+                if score == 5:
+                    assert not aois
+                    assert strs
+                elif score == 4:
+                    assert aois
+                    assert all(a["severity"].lower() == "minor" for a in aois)
+                    assert strs
+                elif score in [2, 3]:
+                    assert aois
+                    assert any(a["severity"].lower() == "substantial" for a in aois)
+                    assert strs
+                elif score == 1:
+                    assert aois
+                    assert any(a["severity"].lower() == "substantial" for a in aois)
+                    assert not strs
+            
+            return {
+                "score_1": float(score_1),
+                "score_2": float(score_2),
+                "ranking": float(ranking),
+                "response_1_analysis": parsed.get("response_1_analysis", ""),
+                "response_2_analysis": parsed.get("response_2_analysis", ""),
+                "parsing_success": parsing_success
+            }
+
         except Exception as e:
             self.logger.error(f"Unexpected error parsing response: {e}")
             return {
@@ -190,7 +213,16 @@ class VanillaGenRMWorker:
         
         # Ranking accuracy using L1 distance
         if gt_ranking is not None and extracted["ranking"] is not None:
-            distance_ranking = abs(float(extracted["ranking"]) - float(gt_ranking))
+            if gt_ranking < 0 and extracted["ranking"] < 0:
+                distance_ranking = 0.0
+            elif gt_ranking < 0 and extracted["ranking"] > 0:
+                max_score = max(float(extracted["score_1"]), float(extracted["score_2"]))
+                distance_ranking = max(1.0, max_score - 2.0)
+            elif gt_ranking > 0 and extracted["ranking"] < 0:
+                distance_ranking = 1.0  # could be improved
+            else:
+                assert gt_ranking > 0 and extracted["ranking"] > 0
+                distance_ranking = abs(float(extracted["ranking"]) - float(gt_ranking))
             total_l1_distance += distance_ranking * config["ranking_weight"]
             num_components += 1
         
