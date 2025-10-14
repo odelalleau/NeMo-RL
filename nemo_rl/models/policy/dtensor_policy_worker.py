@@ -105,9 +105,8 @@ def get_cpu_state_dict(
     return new_state_dict
 
 
-@ray.remote(
-    runtime_env={"env_vars": {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}}
-)
+# runtime_env={"env_vars": {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}}
+@ray.remote
 class DTensorPolicyWorker:
     DEFAULT_PY_EXECUTABLE = PY_EXECUTABLES.BASE
 
