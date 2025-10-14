@@ -102,6 +102,8 @@ class VanillaGenRMWorker:
                 assert delta <= -2
             elif ranking == -1:
                 assert score_1 <= 2 and score_2 <= 2
+            if score_1 <= 2 and score_2 <= 2:
+                assert ranking == -1
 
             for resp_idx in [1, 2]:
                 score = score_1 if resp_idx == 1 else score_2
@@ -124,6 +126,10 @@ class VanillaGenRMWorker:
                     assert not strs
                 else:
                     assert False
+                if not strs:
+                    assert score == 1
+                if not aois:
+                    assert score == 5
                 if aois and all(a["severity"].lower() == "minor" for a in aois):
                     assert score == 4
 
@@ -221,12 +227,21 @@ class VanillaGenRMWorker:
                 distance_ranking = 0.0
             elif gt_ranking < 0 and extracted["ranking"] > 0:
                 max_score = max(float(extracted["score_1"]), float(extracted["score_2"]))
+                # At least 1 because if `max_score` is 1 or 2, then the ranking should have been -1.
                 distance_ranking = max(1.0, max_score - 2.0)
             elif gt_ranking > 0 and extracted["ranking"] < 0:
-                distance_ranking = 1.0  # could be improved
+                if gt_score_1 is not None and gt_score_2 is not None:
+                    max_score = max(float(gt_score_1), float(gt_score_2))
+                    # Can be zero because if `max_score` is 1 or 2, then the ground truth ranking should have been -1.
+                    distance_ranking = max(0.0, max_score - 2.0)
+                else:
+                    distance_ranking = 1.0
             else:
                 assert gt_ranking > 0 and extracted["ranking"] > 0
                 distance_ranking = abs(float(extracted["ranking"]) - float(gt_ranking))
+                if (gt_ranking < 3.5) != (extracted["ranking"] < 3.5):
+                    # Additional penalty if they disagree on which response is better.
+                    distance_ranking += 1.0
             total_l1_distance += distance_ranking * config["ranking_weight"]
             num_components += 1
 
