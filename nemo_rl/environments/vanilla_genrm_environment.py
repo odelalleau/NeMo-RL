@@ -28,9 +28,9 @@ from nemo_rl.environments.interfaces import (
 )
 
 
-
 class VanillaGenRMConfig(TypedDict):
     """Configuration for Vanilla GenRM training environment."""
+
     num_workers: int  # Number of worker processes for parallel evaluation
     score_weight: float  # Weight for individual scores (default: 1.0)
     ranking_weight: float  # Weight for ranking scores (default: 1.0)
@@ -39,6 +39,7 @@ class VanillaGenRMConfig(TypedDict):
 
 class VanillaGenRMMetadata(TypedDict):
     """Metadata structure for vanilla GenRM environment."""
+
     question_id: Optional[str]
     num_responses: Optional[int]
     score_1: Optional[int]  # Individual helpfulness score for response 1
@@ -54,18 +55,16 @@ class VanillaGenRMWorker:
     def __init__(self):
         """Initialize the GenRM evaluation worker."""
         logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            force=True
+            level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", force=True
         )
         self.logger = logging.getLogger(__name__)
 
     def extract_scores_from_response(self, response: str) -> Dict[str, Any]:
         """Extract scores from the model's JSON response.
-        
+
         Args:
             response: The model's response containing JSON with scores (already split if needed)
-            
+
         Returns:
             Dictionary containing extracted scores, or None values if parsing fails
         """
@@ -88,10 +87,10 @@ class VanillaGenRMWorker:
             score_1 = int(parsed["response_1_analysis"]["quality"])
             score_2 = int(parsed["response_2_analysis"]["quality"])
             ranking = int(parsed["preference_ranking"])
-            
+
             parsing_success = 1 <= score_1 <= 5 and 1 <= score_2 <= 5 and (1 <= ranking <= 6 or ranking == -1)
             delta = score_1 - score_2
-            if ranking  == 1:
+            if ranking == 1:
                 assert delta >= 2
             elif ranking == 2:
                 assert delta in [1, 2]
@@ -103,7 +102,7 @@ class VanillaGenRMWorker:
                 assert delta <= -2
             elif ranking == -1:
                 assert score_1 <= 2 and score_2 <= 2
-            
+
             for resp_idx in [1, 2]:
                 score = score_1 if resp_idx == 1 else score_2
                 aois = parsed[f"response_{resp_idx}_analysis"]["areas_for_improvement"]
@@ -123,14 +122,14 @@ class VanillaGenRMWorker:
                     assert aois
                     assert any(a["severity"].lower() == "substantial" for a in aois)
                     assert not strs
-            
+
             return {
                 "score_1": float(score_1),
                 "score_2": float(score_2),
                 "ranking": float(ranking),
                 "response_1_analysis": parsed.get("response_1_analysis", ""),
                 "response_2_analysis": parsed.get("response_2_analysis", ""),
-                "parsing_success": parsing_success
+                "parsing_success": parsing_success,
             }
 
         except Exception:
@@ -141,82 +140,77 @@ class VanillaGenRMWorker:
                 "ranking": None,
                 "response_1_analysis": "",
                 "response_2_analysis": "",
-                "parsing_success": False
+                "parsing_success": False,
             }
 
     def evaluate_responses(
-        self, 
-        assistant_responses: List[str], 
-        metadata_list: List[VanillaGenRMMetadata],
-        config: VanillaGenRMConfig
+        self, assistant_responses: List[str], metadata_list: List[VanillaGenRMMetadata], config: VanillaGenRMConfig
     ) -> List[float]:
         """Evaluate assistant responses and compute rewards.
-        
+
         Args:
             assistant_responses: List of assistant responses to evaluate
             metadata_list: List of metadata containing ground truth scores
             config: Configuration for the environment
-            
+
         Returns:
             List of rewards for each response
         """
         rewards = []
-        
+
         for response, metadata in zip(assistant_responses, metadata_list):
             # Extract scores from the model's response
             extracted = self.extract_scores_from_response(response)
-            
+
             # Get ground truth values
             gt_score_1 = metadata.get("score_1")
-            gt_score_2 = metadata.get("score_2") 
+            gt_score_2 = metadata.get("score_2")
             gt_ranking = metadata.get("ranking")
-            
+
             # Calculate reward based on configuration
-            reward = self._calculate_reward(
-                extracted, gt_score_1, gt_score_2, gt_ranking, config
-            )
+            reward = self._calculate_reward(extracted, gt_score_1, gt_score_2, gt_ranking, config)
             rewards.append(reward)
-            
+
         return rewards
 
     def _calculate_reward(
         self,
         extracted: Dict[str, Any],
         gt_score_1: Optional[float],
-        gt_score_2: Optional[float], 
+        gt_score_2: Optional[float],
         gt_ranking: Optional[int],
-        config: VanillaGenRMConfig
+        config: VanillaGenRMConfig,
     ) -> float:
         """Calculate reward based on extracted scores vs ground truth using negative L1 distance.
         Always evaluates both individual scores and ranking (combined approach).
-        
+
         Args:
             extracted: Extracted scores from model response
             gt_score_1: Ground truth score for response 1
             gt_score_2: Ground truth score for response 2
             gt_ranking: Ground truth ranking
             config: Environment configuration
-            
+
         Returns:
             Calculated reward value (negative L1 distance)
         """
         if not extracted["parsing_success"]:
             return -100.0  # Large negative penalty if parsing failed
-            
+
         total_l1_distance = 0.0
         num_components = 0
-        
+
         # Individual score accuracy using L1 distance
         if gt_score_1 is not None and extracted["score_1"] is not None:
             distance_1 = abs(float(extracted["score_1"]) - float(gt_score_1))
             total_l1_distance += distance_1 * config["score_weight"]
             num_components += 1
-            
+
         if gt_score_2 is not None and extracted["score_2"] is not None:
             distance_2 = abs(float(extracted["score_2"]) - float(gt_score_2))
             total_l1_distance += distance_2 * config["score_weight"]
             num_components += 1
-        
+
         # Ranking accuracy using L1 distance
         if gt_ranking is not None and extracted["ranking"] is not None:
             if gt_ranking < 0 and extracted["ranking"] < 0:
@@ -231,17 +225,17 @@ class VanillaGenRMWorker:
                 distance_ranking = abs(float(extracted["ranking"]) - float(gt_ranking))
             total_l1_distance += distance_ranking * config["ranking_weight"]
             num_components += 1
-        
+
         # Return negative L1 distance (higher rewards for smaller distances)
         if num_components > 0:
             reward = -total_l1_distance
         else:
             reward = -100.0  # Large negative penalty if no valid components
-            
+
         return reward
 
 
-@ray.remote  
+@ray.remote
 class VanillaGenRMEnvironment(EnvironmentInterface):
     """Environment for training vanilla GenRM models on response evaluation tasks."""
 
@@ -249,23 +243,21 @@ class VanillaGenRMEnvironment(EnvironmentInterface):
 
     def __init__(self, cfg: VanillaGenRMConfig):
         """Initialize the vanilla GenRM environment.
-        
+
         Args:
             cfg: Configuration for the environment
         """
         self.cfg = cfg
         self.num_workers = cfg["num_workers"]
-        
+
         # Set default values for optional config parameters
         self.cfg.setdefault("score_weight", 1.0)
-        self.cfg.setdefault("ranking_weight", 1.0) 
+        self.cfg.setdefault("ranking_weight", 1.0)
         self.cfg.setdefault("reasoning_split_word", "</think>")
-        
+
         # Create worker pool
-        self.workers = [
-            VanillaGenRMWorker.remote() for _ in range(self.num_workers)
-        ]
-        
+        self.workers = [VanillaGenRMWorker.remote() for _ in range(self.num_workers)]
+
         self.logger = logging.getLogger(__name__)
 
     def shutdown(self):
@@ -283,7 +275,7 @@ class VanillaGenRMEnvironment(EnvironmentInterface):
         Args:
             message_log_batch: Batch of message logs from the LLM interactions
             metadata: Batch of metadata containing ground truth scores
-            
+
         Returns:
             EnvironmentReturn with observations, metadata, stop strings, rewards, and done flags
         """
@@ -317,16 +309,14 @@ class VanillaGenRMEnvironment(EnvironmentInterface):
         # Distribute work across workers
         batch_size = len(assistant_responses)
         chunk_size = max(1, batch_size // self.num_workers)
-        
+
         futures = []
         for i in range(0, batch_size, chunk_size):
             end_idx = min(i + chunk_size, batch_size)
             worker_idx = (i // chunk_size) % self.num_workers
-            
+
             future = self.workers[worker_idx].evaluate_responses.remote(
-                processed_responses[i:end_idx],
-                metadata[i:end_idx], 
-                self.cfg
+                processed_responses[i:end_idx], metadata[i:end_idx], self.cfg
             )
             futures.append(future)
 
@@ -338,37 +328,32 @@ class VanillaGenRMEnvironment(EnvironmentInterface):
         observations = []
         for reward in rewards_list:
             content = f"Environment: Score = {reward:.2f}"
-                
-            observations.append({
-                "role": "environment",
-                "content": content
-            })
+
+            observations.append({"role": "environment", "content": content})
 
         # Convert to tensors
         rewards_tensor = torch.tensor(rewards_list, dtype=torch.float32).cpu()
         done_tensor = torch.ones_like(rewards_tensor, dtype=torch.bool).cpu()
-        
+
         # All episodes terminate after one step for this task
         next_stop_strings = [None] * len(message_log_batch)
 
         return EnvironmentReturn(
             observations=observations,
             metadata=metadata,
-            next_stop_strings=next_stop_strings, 
+            next_stop_strings=next_stop_strings,
             rewards=rewards_tensor,
             terminateds=done_tensor,
         )
 
-    def global_post_process_and_metrics(
-        self, batch: BatchedDataDict
-    ) -> Tuple[BatchedDataDict, dict]:
+    def global_post_process_and_metrics(self, batch: BatchedDataDict) -> Tuple[BatchedDataDict, dict]:
         """Compute global metrics for the vanilla GenRM environment.
-        
+
         Args:
             batch: Global batch of rollout data
-            
+
         Returns:
             Tuple of (processed_batch, metrics_dict)
         """
         metrics = {}
-        return batch, metrics 
+        return batch, metrics
