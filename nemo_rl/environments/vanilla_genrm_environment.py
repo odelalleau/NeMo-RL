@@ -69,15 +69,20 @@ class VanillaGenRMWorker:
         Returns:
             Dictionary containing extracted scores, or None values if parsing fails
         """
+        json_str = None
         try:
             # Try to find JSON in the response
             response = response.strip()
-            json_str = None
-            json_start = 0 if response.startswith("```json\n") else response.rfind("\n```json\n")
+            if response.startswith("```json"):
+                json_start = 7
+            else:
+                json_start = response.rfind("\n```json\n")
+                if json_start >= 0:
+                    json_start += 8
             if json_start >= 0:
                 json_end = response.rfind("\n```")
                 if json_end > json_start:
-                    json_str = response[json_start + len("\n```json\n"):json_end].strip()
+                    json_str = response[json_start:json_end].strip()
             assert json_str
             parsed = json.loads(json_str)
             score_1 = int(parsed["response_1_analysis"]["quality"])
@@ -129,7 +134,7 @@ class VanillaGenRMWorker:
             }
 
         except Exception:
-            self.logger.exception(f"Unexpected error parsing response:\n{response}\nError:")
+            self.logger.exception(f"Unexpected error parsing response:\n{response}\n{repr(json_str)}\nError:")
             return {
                 "score_1": None,
                 "score_2": None,
