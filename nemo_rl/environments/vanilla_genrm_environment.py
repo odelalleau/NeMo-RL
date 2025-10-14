@@ -112,7 +112,7 @@ class VanillaGenRMWorker:
                     assert strs
                 elif score == 4:
                     assert aois
-                    assert all(a["severity"].lower() == "minor" for a in aois)
+                    assert all(a["severity"].lower() in ["minor", "substantial"] for a in aois)
                     assert strs
                 elif score in [2, 3]:
                     assert aois
@@ -122,6 +122,10 @@ class VanillaGenRMWorker:
                     assert aois
                     assert any(a["severity"].lower() == "substantial" for a in aois)
                     assert not strs
+                else:
+                    assert False
+                if aois and all(a["severity"].lower() == "minor" for a in aois):
+                    assert score == 4
 
             return {
                 "score_1": float(score_1),
