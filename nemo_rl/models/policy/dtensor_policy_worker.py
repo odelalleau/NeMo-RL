@@ -132,6 +132,7 @@ class DTensorPolicyWorker:
     ):
         self.cfg = config
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
+        assert False, os.getenv("PYTORCH_CUDA_ALLOC_CONF")
         torch.distributed.init_process_group(backend="nccl")
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
