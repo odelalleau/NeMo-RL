@@ -959,14 +959,19 @@ class AsyncPenguinRolloutResult:
 def _calculate_single_metric(
     values: list[float], batch_size: int, key_name: str
 ) -> dict:
-    return {
+    metrics = {
         f"{key_name}/mean": sum(values) / batch_size,
         f"{key_name}/max": max(values),
         f"{key_name}/min": min(values),
         f"{key_name}/median": statistics.median(values),
-        f"{key_name}/stddev": statistics.stdev(values),
         f"{key_name}/histogram": Histogram(values),
     }
+    # stdev requires at least 2 data points
+    if len(values) >= 2:
+        metrics[f"{key_name}/stddev"] = statistics.stdev(values)
+    else:
+        metrics[f"{key_name}/stddev"] = 0.0
+    return metrics
 
 
 def run_async_penguin_rollout(
