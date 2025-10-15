@@ -1632,9 +1632,14 @@ def grpo_train(
             current_step += 1
             total_steps += 1
             if should_save_by_timeout:
-                break
+                print("Timeout has been reached, stopping training early", flush=True)
+                return
             if total_steps >= max_num_steps:
-                break
+                print(
+                    "Max number of steps has been reached, stopping training early",
+                    flush=True,
+                )
+                return
 
         current_epoch += 1
         current_step = 0  # Reset step counter for new epoch
