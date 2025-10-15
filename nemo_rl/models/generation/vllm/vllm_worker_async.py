@@ -131,6 +131,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             )
 
     async def post_init_async(self):
+        # Skip post-init for non-model-owner workers
+        if not self.is_model_owner:
+            self.vllm_device_ids = []
+            return
         self.vllm_device_ids = await self.report_device_id_async()
 
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
@@ -744,6 +748,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 stop_token_ids=self.cfg["stop_token_ids"],
                 stop=final_stop_strings,
                 include_stop_str_in_output=True,  # returning stop strings like hf
+                skip_special_tokens=False,  # Keep <think> tags and other special tokens
             )
 
             request_id = str(uuid.uuid4())

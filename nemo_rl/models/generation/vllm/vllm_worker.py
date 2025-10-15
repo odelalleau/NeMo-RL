@@ -456,6 +456,7 @@ class BaseVllmGenerationWorker:
             stop_token_ids=self.cfg["stop_token_ids"],
             stop=stop_strings,
             include_stop_str_in_output=True,
+            skip_special_tokens=False,  # Keep <think> tags and other special tokens
         )
 
     def start_gpu_profiling(self) -> None:
@@ -481,6 +482,10 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         self.llm = vllm.LLM(**llm_kwargs)
 
     def post_init(self):
+        # Skip post-init for non-model-owner workers
+        if not self.is_model_owner:
+            self.vllm_device_ids = []
+            return
         self.vllm_device_ids = self.report_device_id()
 
     def init_collective(
@@ -676,6 +681,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             stop_token_ids=self.cfg["stop_token_ids"],
             stop=stop_strings,
             include_stop_str_in_output=True,  # returning stop strings like hf
+            skip_special_tokens=False,  # Keep <think> tags and other special tokens
         )
 
         # Generate outputs
