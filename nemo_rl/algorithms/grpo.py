@@ -851,6 +851,7 @@ def grpo_train(
                     logger.log_metrics(
                         val_metrics, total_steps + 1, prefix="validation"
                     )
+
                 metrics = {
                     "loss": train_results["loss"].numpy(),
                     "reward": rewards.numpy(),
@@ -858,6 +859,8 @@ def grpo_train(
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),
                 }
+                if "moe_metrics" in train_results:
+                    metrics.update({f"moe/{k}": v for k, v in train_results["moe_metrics"].items()})
                 metrics.update(train_results["all_mb_metrics"])
                 for k, v in metrics.items():
                     if k in {
