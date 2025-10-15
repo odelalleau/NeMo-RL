@@ -368,11 +368,19 @@ class VllmGeneration(GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data(
             method_name, run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"]
         )
-        # Wait for all futures to complete
+        # Wait for all futures to complete with timeout
         try:
-            results = ray.get(futures)
+            # Add timeout to prevent indefinite hanging (20 minutes should be enough for most models)
+            results = ray.get(futures, timeout=1200)
+        except ray.exceptions.GetTimeoutError as e:
+            logger.error(f"vLLM worker initialization timed out after 1200 seconds: {e}")
+            logger.error("This may indicate a worker is hanging. Exiting to avoid wasting GPU resources.")
+            sys.exit(1)
         except (ray.exceptions.ActorDiedError, ray.exceptions.RayTaskError) as e:
             logger.error(f"vLLM worker initialization failed: {e}")
+            sys.exit(1)
+        except Exception as e:
+            logger.error(f"Unexpected error during vLLM worker initialization: {e}")
             sys.exit(1)
         return results
 

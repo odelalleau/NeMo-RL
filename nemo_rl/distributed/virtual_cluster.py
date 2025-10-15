@@ -331,8 +331,8 @@ class RayVirtualCluster:
         # Add timeout to prevent hanging indefinitely
         try:
             ray.get(
-                [pg.ready() for pg in placement_groups], timeout=180
-            )  # 3-minute timeout
+                [pg.ready() for pg in placement_groups], timeout=900
+            )  # 15-minute timeout (increased for venv building)
         except (TimeoutError, ray.exceptions.GetTimeoutError):
             # Clean up any created placement groups
             for pg in placement_groups:
