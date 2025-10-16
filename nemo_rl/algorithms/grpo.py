@@ -1378,6 +1378,7 @@ def grpo_train(
                         val_metrics, total_steps + 1, prefix="validation"
                     )
 
+                # Build comprehensive metrics dictionary once
                 metrics = {
                     "loss": train_results["loss"].numpy(),
                     "reward": rewards.numpy(),
@@ -1388,8 +1389,16 @@ def grpo_train(
                 if "moe_metrics" in train_results:
                     metrics.update({f"moe/{k}": v for k, v in train_results["moe_metrics"].items()})
                 metrics.update(train_results["all_mb_metrics"])
+                
+                # Aggregate metrics with special handling for inf values
                 for k, v in metrics.items():
-                    if k in {
+                    if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                        valid_values = [x for x in v if not np.isinf(x)]
+                        metrics[k] = np.min(valid_values).item() if valid_values else -1.0
+                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                        valid_values = [x for x in v if not np.isinf(x)]
+                        metrics[k] = np.max(valid_values).item() if valid_values else -1.0
+                    elif k in {
                         "lr",
                         "wd",
                         "reward",
@@ -1400,7 +1409,38 @@ def grpo_train(
                         metrics[k] = np.mean(v).item()
                     else:
                         metrics[k] = np.sum(v).item()
+                
+                # Add all additional metrics
                 metrics.update(rollout_metrics)
+                
+                # Add sequence-level error metrics (useful for deciding threshold)
+                metrics["max_seq_mult_prob_error"] = max_seq_mult_prob_error
+                metrics["num_masked_seqs_by_logprob_error"] = num_masked_seqs
+                metrics["masked_correct_pct"] = masked_correct_pct
+                
+                # Add Best@k metrics (will be non-empty only if Best@k or combined training was used)
+                metrics.update(best_at_k_metrics)
+                
+                # Log Pass@R metric (R = num_generations_per_prompt)
+                metrics[f"pass_at_{num_generations}"] = pass_at_r_metric
+                # Log percentage of prompts with variance in rewards (after filtering if dynamic sampling is used)
+                metrics["prompts_with_reward_variance_pct"] = prompts_with_variance
+                
+                # Add dynamic sampling metrics if enabled
+                if oversample_ratio > 1.0 and 'num_selected' in locals():
+                    metrics["dynamic_sampling_oversample_ratio"] = oversample_ratio
+                    metrics["dynamic_sampling_original_prompts"] = original_num_prompts
+                    metrics["dynamic_sampling_retained_prompts"] = num_selected
+                    metrics["dynamic_sampling_filtering_rate"] = filtering_rate
+                    if 'num_with_signal' in locals():
+                        metrics["dynamic_sampling_prompts_with_signal"] = num_with_signal
+                        metrics["dynamic_sampling_prompts_without_signal"] = num_without_signal
+                    if 'prompts_with_variance_before_filter' in locals():
+                        metrics["dynamic_sampling_pre_filter_reward_variance_pct"] = prompts_with_variance_before_filter
+                    if 'prompts_with_variance_after_filter' in locals():
+                        metrics["dynamic_sampling_post_filter_reward_variance_pct"] = prompts_with_variance_after_filter
+                
+                # Update global counter
                 total_valid_tokens += metrics["global_valid_toks"]
 
                 ## Checkpointing
@@ -1507,61 +1547,7 @@ def grpo_train(
                 reward=sample_reward,
             )
 
-            metrics = {
-                "loss": train_results["loss"].numpy(),
-                "reward": rewards.numpy(),
-                "grad_norm": train_results["grad_norm"].numpy(),
-                "mean_prompt_length": repeated_batch["length"].numpy(),
-                "total_num_tokens": input_lengths.numpy(),
-            }
-            metrics.update(train_results["all_mb_metrics"])
-            for k, v in metrics.items():
-                if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
-                    valid_values = [x for x in v if not np.isinf(x)]
-                    metrics[k] = np.min(valid_values).item() if valid_values else -1.0
-                elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
-                    valid_values = [x for x in v if not np.isinf(x)]
-                    metrics[k] = np.max(valid_values).item() if valid_values else -1.0
-                elif k in {
-                    "lr",
-                    "wd",
-                    "reward",
-                    "global_valid_seqs",
-                    "global_valid_toks",
-                    "mean_prompt_length",
-                }:
-                    metrics[k] = np.mean(v).item()
-                else:
-                    metrics[k] = np.sum(v).item()
-            metrics.update(rollout_metrics)
-            
-            # Always log sequence-level error metrics (useful for deciding threshold)
-            metrics["max_seq_mult_prob_error"] = max_seq_mult_prob_error
-            metrics["num_masked_seqs_by_logprob_error"] = num_masked_seqs
-            metrics["masked_correct_pct"] = masked_correct_pct
-
-            # Add Best@k metrics (will be non-empty only if Best@k or combined training was used)
-            metrics.update(best_at_k_metrics)
-
-            # Log Pass@R metric (R = num_generations_per_prompt)
-            metrics[f"pass_at_{num_generations}"] = pass_at_r_metric
-            # Log percentage of prompts with variance in rewards (after filtering if dynamic sampling is used)
-            metrics["prompts_with_reward_variance_pct"] = prompts_with_variance
-            
-            # Add dynamic sampling metrics if enabled
-            if oversample_ratio > 1.0 and 'num_selected' in locals():
-                metrics["dynamic_sampling_oversample_ratio"] = oversample_ratio
-                metrics["dynamic_sampling_original_prompts"] = original_num_prompts
-                metrics["dynamic_sampling_retained_prompts"] = num_selected
-                metrics["dynamic_sampling_filtering_rate"] = filtering_rate
-                if 'num_with_signal' in locals():
-                    metrics["dynamic_sampling_prompts_with_signal"] = num_with_signal
-                    metrics["dynamic_sampling_prompts_without_signal"] = num_without_signal
-                if 'prompts_with_variance_before_filter' in locals():
-                    metrics["dynamic_sampling_pre_filter_reward_variance_pct"] = prompts_with_variance_before_filter
-                if 'prompts_with_variance_after_filter' in locals():
-                    metrics["dynamic_sampling_post_filter_reward_variance_pct"] = prompts_with_variance_after_filter
-
+            # Metrics already computed above before checkpointing
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"
             )  # type: ignore
