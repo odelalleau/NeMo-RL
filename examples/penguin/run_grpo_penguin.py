@@ -39,6 +39,7 @@ from nemo_rl.environments.penguin import (
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
+from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
 OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
 
@@ -184,11 +185,23 @@ The validation set you pass in will directly be used for validation with no addi
         base_urls=policy_generation.dp_openai_server_base_urls,
         initial_global_config_dict=config["env"]["penguin"],
     )
+    penguin_py_exec = get_actor_python_env(
+        "nemo_rl.environments.penguin.Penguin"
+    )
+    if penguin_py_exec.startswith("uv"):
+        # Lazily build a dedicated venv across all Ray nodes on-demand.
+        penguin_py_exec = create_local_venv_on_each_node(
+            penguin_py_exec,
+            "nemo_rl.environments.penguin.Penguin"
+        )
     penguin = Penguin.options(
         runtime_env={
-            "py_executable": get_actor_python_env(
-                "nemo_rl.environments.penguin.Penguin"
-            ),
+            "py_executable": penguin_py_exec,
+            "env_vars": {
+                **os.environ,
+                "VIRTUAL_ENV": penguin_py_exec,
+                "UV_PROJECT_ENVIRONMENT": penguin_py_exec,
+            },
         }
     ).remote(penguin_config)
     # Blocking wait for penguin to spin up

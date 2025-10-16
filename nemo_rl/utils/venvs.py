@@ -95,6 +95,7 @@ def create_local_venv(
     exec_cmd.extend(["echo", f"Finished creating venv {venv_path}"])
 
     # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
+    subprocess.run("uv pip install setuptools setuptools_scm torch==2.8.0 --torch-backend=cu128".split(), env=env | {"VIRTUAL_ENV": venv_path}, check=True)
     subprocess.run(["uv", "sync"], env=env, check=True)
     subprocess.run(exec_cmd, env=env, check=True)
 
