@@ -59,6 +59,18 @@ class VanillaGenRMWorker:
         )
         self.logger = logging.getLogger(__name__)
 
+    def remove_excerpts(self, json_str: str) -> str:
+        """
+        Remove all JSON "excerpt" fields.
+        """
+        new_lines = []
+        for line in json_str.splitlines():
+            if line.lstrip().startswith('"excerpt"'):
+                # Remove the entire line
+                continue
+            new_lines.append(line)
+        return "\n".join(new_lines)
+
     def extract_scores_from_response(self, response: str) -> Dict[str, Any]:
         """Extract scores from the model's JSON response.
 
@@ -83,16 +95,18 @@ class VanillaGenRMWorker:
                 if json_end > json_start:
                     json_str = response[json_start:json_end].strip()
             assert json_str
-            parsed = json.loads(json_str)
+            try:
+                parsed = json.loads(json_str)
+            except json.JSONDecodeError:
+                # A common cause of parsing failures is incorrect JSON encoding of
+                # response excerpts.
+                json_str = self.remove_excerpts(json_str)
+                parsed = json.loads(json_str)
             score_1 = int(parsed["response_1_analysis"]["quality"])
             score_2 = int(parsed["response_2_analysis"]["quality"])
             ranking = int(parsed["preference_ranking"])
 
-            assert (
-                1 <= score_1 <= 5
-                and 1 <= score_2 <= 5
-                and (1 <= ranking <= 6 or ranking == -1)
-            )
+            assert 1 <= score_1 <= 5 and 1 <= score_2 <= 5 and (1 <= ranking <= 6 or ranking == -1)
             delta = score_1 - score_2
             if ranking == 1:
                 assert delta >= 2
