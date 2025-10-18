@@ -88,7 +88,11 @@ class VanillaGenRMWorker:
             score_2 = int(parsed["response_2_analysis"]["quality"])
             ranking = int(parsed["preference_ranking"])
 
-            parsing_success = 1 <= score_1 <= 5 and 1 <= score_2 <= 5 and (1 <= ranking <= 6 or ranking == -1)
+            assert (
+                1 <= score_1 <= 5
+                and 1 <= score_2 <= 5
+                and (1 <= ranking <= 6 or ranking == -1)
+            )
             delta = score_1 - score_2
             if ranking == 1:
                 assert delta >= 2
@@ -108,13 +112,17 @@ class VanillaGenRMWorker:
             for resp_idx in [1, 2]:
                 score = score_1 if resp_idx == 1 else score_2
                 aois = parsed[f"response_{resp_idx}_analysis"]["areas_for_improvement"]
+                for a in aois:
+                    assert sorted(a) == ["description", "excerpt", "severity"]
+                    assert isinstance(a["description"], str) and a["description"]
+                    assert a["excerpt"] is None or isinstance(a["excerpt"], str)
+                    assert a["severity"].lower() in ["minor", "substantial"]
                 strs = parsed[f"response_{resp_idx}_analysis"]["strengths"]
                 if score == 5:
                     assert not aois
                     assert strs
                 elif score == 4:
                     assert aois
-                    assert all(a["severity"].lower() in ["minor", "substantial"] for a in aois)
                     assert strs
                 elif score in [2, 3]:
                     assert aois
