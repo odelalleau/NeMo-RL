@@ -532,6 +532,7 @@ class MegatronPolicyWorker:
         model_cfg = cfg_from_pretrained.model
         cfg_from_pretrained.logger = LoggerConfig()
 
+        model_cfg.perform_initialization = True
         model_cfg.tensor_model_parallel_size = self.cfg["megatron_cfg"][
             "tensor_model_parallel_size"
         ]
