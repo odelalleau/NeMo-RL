@@ -27,6 +27,35 @@ from nemo_rl.environments.interfaces import (
     EnvironmentReturn,
 )
 
+# Map a ranking (1-6) to a penalty for each value of delta in score_1 - score_2.
+RANKING_DELTA_PENALTY = {
+    1: {4: 0, 3: 0, 2: 0, 1: 1, 0: 3, -1: 5, -2: 8, -3: 13, -4: 21},
+    2: {4: 2, 3: 1, 2: 0, 1: 0, 0: 2, -1: 5, -2: 8, -3: 13, -4: 21},
+    3: {4: 5, 3: 3, 2: 2, 1: 0, 0: 0, -1: 3, -2: 5, -3: 8, -4: 13},
+    4: {4: 13, 3: 8, 2: 5, 1: 3, 0: 0, -1: 0, -2: 2, -3: 3, -4: 5},
+    5: {4: 21, 3: 13, 2: 8, 1: 5, 0: 2, -1: 0, -2: 0, -3: 1, -4: 2},
+    6: {4: 21, 3: 13, 2: 8, 1: 5, 0: 3, -1: 1, -2: 0, -3: 0, -4: 0},
+}
+
+# Map ground truth rating to the penalty for each predicted rating.
+RATING_PENALTY = {
+    5: {5: 0, 4: 2, 3: 5, 2: 8, 1: 13},
+    4: {5: 1, 4: 0, 3: 2, 2: 5, 1: 8},
+    3: {5: 3, 4: 1, 3: 0, 2: 2, 1: 3},
+    2: {5: 8, 4: 3, 3: 2, 2: 0, 1: 1},
+    1: {5: 13, 4: 5, 3: 3, 2: 2, 1: 0},
+}
+
+# Map ground truth ranking to the penalty for each predicted ranking.
+RANKING_PENALTY = {
+    1: {1: 0, 2: 2, 3: 3, 4: 8, 5: 13, 6: 21},
+    2: {1: 1, 2: 0, 3: 2, 4: 5, 5: 8, 6: 13},
+    3: {1: 2, 2: 1, 3: 0, 4: 2, 5: 3, 6: 8},
+    4: {1: 8, 2: 3, 3: 5, 4: 0, 5: 1, 6: 2},
+    5: {1: 13, 2: 8, 3: 5, 4: 2, 5: 0, 6: 1},
+    6: {1: 21, 2: 13, 3: 8, 4: 3, 5: 2, 6: 0},
+}
+
 
 class VanillaGenRMConfig(TypedDict):
     """Configuration for Vanilla GenRM training environment."""
@@ -81,6 +110,7 @@ class VanillaGenRMWorker:
             Dictionary containing extracted scores, or None values if parsing fails
         """
         json_str = None
+        format_penalty = 0.0
         try:
             # Try to find JSON in the response
             response = response.strip()
@@ -102,66 +132,71 @@ class VanillaGenRMWorker:
                 # response excerpts.
                 json_str = self.remove_excerpts(json_str)
                 parsed = json.loads(json_str)
-            score_1 = int(parsed["response_1_analysis"]["quality"])
-            score_2 = int(parsed["response_2_analysis"]["quality"])
-            ranking = int(parsed["preference_ranking"])
-
+                format_penalty += 1
+            score_1 = parsed["response_1_analysis"]["quality"]
+            score_2 = parsed["response_2_analysis"]["quality"]
+            ranking = parsed["preference_ranking"]
+            assert isinstance(score_1, int) and isinstance(score_2, int) and isinstance(ranking, int)
             assert 1 <= score_1 <= 5 and 1 <= score_2 <= 5 and (1 <= ranking <= 6 or ranking == -1)
             delta = score_1 - score_2
-            if ranking == 1:
-                assert delta >= 2
-            elif ranking == 2:
-                assert delta in [1, 2]
-            elif ranking in [3, 4]:
-                assert delta in [-1, 0, 1]
-            elif ranking == 5:
-                assert delta in [-1, -2]
-            elif ranking == 6:
-                assert delta <= -2
-            elif ranking == -1:
-                assert score_1 <= 2 and score_2 <= 2
-            if score_1 <= 2 and score_2 <= 2:
-                assert ranking == -1
+            if ranking == -1:
+                max_score = max(score_1, score_2)
+                if max_score > 2:
+                    format_penalty = {3: 1, 4: 5, 5: 13}[max_score]
+            else:
+                format_penalty += RANKING_DELTA_PENALTY[ranking][delta]
+            if score_1 <= 2 and score_2 <= 2 and ranking != -1:
+                ranking_strength = abs(ranking * 2 - 7)
+                format_penalty += ranking_strength
 
             for resp_idx in [1, 2]:
                 score = score_1 if resp_idx == 1 else score_2
                 aois = parsed[f"response_{resp_idx}_analysis"]["areas_for_improvement"]
                 for a in aois:
-                    assert sorted(a) == ["description", "excerpt", "severity"]
+                    assert sorted(a) in [["description", "excerpt", "severity"], ["description", "severity"]]
                     assert isinstance(a["description"], str) and a["description"]
-                    assert a["excerpt"] is None or isinstance(a["excerpt"], str)
+                    if "excerpt" in a:
+                        assert a["excerpt"] is None or isinstance(a["excerpt"], str)
                     assert a["severity"].lower() in ["minor", "substantial"]
                 strs = parsed[f"response_{resp_idx}_analysis"]["strengths"]
                 if score == 5:
-                    assert not aois
-                    assert strs
+                    for aoi in aois:
+                        format_penalty += {"minor": 1, "substantial": 3}[aoi["severity"].lower()]
+                    if not strs:
+                        format_penalty += 5
+                    elif len(strs) == 1:
+                        format_penalty += 1
                 elif score == 4:
-                    assert aois
-                    assert strs
+                    if not aois:
+                        format_penalty += 3
+                    if not strs:
+                        format_penalty += 3
                 elif score in [2, 3]:
-                    assert aois
-                    assert any(a["severity"].lower() == "substantial" for a in aois)
-                    assert strs
+                    if not aois:
+                        format_penalty += 8 - score
+                    if not any(a["severity"].lower() == "substantial" for a in aois):
+                        format_penalty += 5 - score
+                    if not strs:
+                        format_penalty += score - 1
                 elif score == 1:
-                    assert aois
-                    assert any(a["severity"].lower() == "substantial" for a in aois)
-                    assert not strs
+                    if not aois:
+                        format_penalty += 13
+                    elif len(aois) == 1:
+                        format_penalty += 1
+                    if not any(a["severity"].lower() == "substantial" for a in aois):
+                        format_penalty += 5
+                    format_penalty += len(strs)
                 else:
                     assert False
-                if not strs:
-                    assert score == 1
-                if not aois:
-                    assert score == 5
-                if aois and all(a["severity"].lower() == "minor" for a in aois):
-                    assert score == 4
 
             return {
-                "score_1": float(score_1),
-                "score_2": float(score_2),
-                "ranking": float(ranking),
+                "score_1": score_1,
+                "score_2": score_2,
+                "ranking": ranking,
+                "format_penalty": format_penalty,
                 "response_1_analysis": parsed.get("response_1_analysis", ""),
                 "response_2_analysis": parsed.get("response_2_analysis", ""),
-                "parsing_success": parsing_success,
+                "parsing_success": True,
             }
 
         except Exception:
@@ -234,12 +269,12 @@ class VanillaGenRMWorker:
 
         # Individual score accuracy using L1 distance
         if gt_score_1 is not None and extracted["score_1"] is not None:
-            distance_1 = abs(float(extracted["score_1"]) - float(gt_score_1))
+            distance_1 = RATING_PENALTY[int(gt_score_1)][extracted["score_1"]]
             total_l1_distance += distance_1 * config["score_weight"]
             num_components += 1
 
         if gt_score_2 is not None and extracted["score_2"] is not None:
-            distance_2 = abs(float(extracted["score_2"]) - float(gt_score_2))
+            distance_2 = RATING_PENALTY[int(gt_score_2)][extracted["score_2"]]
             total_l1_distance += distance_2 * config["score_weight"]
             num_components += 1
 
@@ -248,28 +283,25 @@ class VanillaGenRMWorker:
             if gt_ranking < 0 and extracted["ranking"] < 0:
                 distance_ranking = 0.0
             elif gt_ranking < 0 and extracted["ranking"] > 0:
-                max_score = max(float(extracted["score_1"]), float(extracted["score_2"]))
+                max_score = max(extracted["score_1"], extracted["score_2"])
                 # At least 1 because if `max_score` is 1 or 2, then the ranking should have been -1.
                 distance_ranking = max(1.0, max_score - 2.0)
             elif gt_ranking > 0 and extracted["ranking"] < 0:
                 if gt_score_1 is not None and gt_score_2 is not None:
-                    max_score = max(float(gt_score_1), float(gt_score_2))
+                    max_score = max(gt_score_1, gt_score_2)
                     # Can be zero because if `max_score` is 1 or 2, then the ground truth ranking should have been -1.
                     distance_ranking = max(0.0, max_score - 2.0)
                 else:
                     distance_ranking = 1.0
             else:
                 assert gt_ranking > 0 and extracted["ranking"] > 0
-                distance_ranking = abs(float(extracted["ranking"]) - float(gt_ranking))
-                if (gt_ranking < 3.5) != (extracted["ranking"] < 3.5):
-                    # Additional penalty if they disagree on which response is better.
-                    distance_ranking += 1.0
+                distance_ranking = RANKING_PENALTY[int(gt_ranking)][extracted["ranking"]]
             total_l1_distance += distance_ranking * config["ranking_weight"]
             num_components += 1
 
         # Return negative L1 distance (higher rewards for smaller distances)
         if num_components > 0:
-            reward = -total_l1_distance
+            reward = -total_l1_distance - extracted["format_penalty"]
         else:
             reward = -100.0  # Large negative penalty if no valid components
 
