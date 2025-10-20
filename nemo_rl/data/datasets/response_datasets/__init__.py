@@ -13,6 +13,7 @@
 # limitations under the License.
 from typing import Any
 
+from nemo_rl.data.datasets.response_datasets.genrm_rlhf import GenRMRLHFDataset
 from nemo_rl.data.datasets.response_datasets.clevr import CLEVRCoGenTDataset
 from nemo_rl.data.datasets.response_datasets.deepscaler import DeepScalerDataset
 from nemo_rl.data.datasets.response_datasets.geometry3k import Geometry3KDataset
@@ -131,4 +132,5 @@ __all__ = [
     "RefCOCODataset",
     "ResponseDataset",
     "SquadDataset",
+    "GenRMRLHFDataset",
 ]
