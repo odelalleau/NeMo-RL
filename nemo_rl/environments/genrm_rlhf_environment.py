@@ -187,9 +187,9 @@ class AsyncGenRMWorker:
         try:
             # Format messages for GenRM
             if self.reasoning_split_word and self.reasoning_split_word in response_1:
-                response_1 = response_1.split(self.reasoning_split_word)[-1].lstrip()
+                response_1 = response_1.split(self.reasoning_split_word)[-1].lstrip().replace("<|im_end|>", "")
             if self.reasoning_split_word and self.reasoning_split_word in response_2:
-                response_2 = response_2.split(self.reasoning_split_word)[-1].lstrip()
+                response_2 = response_2.split(self.reasoning_split_word)[-1].lstrip().replace("<|im_end|>", "")
             messages = self._format_genrm_messages(
                 conversation_history, response_1, response_2
             )
