@@ -14,9 +14,12 @@
 import itertools
 import logging
 import os
+import time
 import uuid
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
+
+import jsonlines
 
 import ray
 import torch
@@ -108,9 +111,7 @@ class AsyncGenRMWorker:
         if not os.path.isdir(hf_home_cache_path):
             try:
                 os.makedirs(hf_home_cache_path, exist_ok=True)
-                logging.info(
-                    f"Created HF cache directory for GenRM worker: {hf_home_cache_path}"
-                )
+                logging.info(f"Created HF cache directory for GenRM worker: {hf_home_cache_path}")
             except OSError as e:
                 logging.warning(
                     f"GenRM worker could not create HF cache directory {hf_home_cache_path}: {e}. "
@@ -395,13 +396,23 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
         logging.info(f"Created {len(self.workers)} AsyncGenRMWorker actors.")
         self._request_counter = 0
         self._actor_id_prefix = str(uuid.uuid4())[:8]
-        self._last_additional_metrics = {}  # Store additional metrics from last step for global_post_process_and_metrics
+        self._last_additional_metrics = (
+            {}
+        )  # Store additional metrics from last step for global_post_process_and_metrics
 
     def shutdown(self):
         for worker in self.workers:
             ray.kill(worker)
         if self.virtual_cluster is not None:
             self.virtual_cluster.shutdown()
+
+    def get_response(self, conv) -> str:
+        assistant_msgs = [msg for msg in conv if msg["role"] == "assistant"]
+        assert assistant_msgs
+        resp = assistant_msgs[-1]["content"]
+        if "</think>" in resp:
+            resp = resp.rsplit("</think>", 1)[1].lstrip()
+        return resp
 
     def step(
         self,
@@ -426,7 +437,7 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
                 prompt_parts.append(f"{msg['role']}: {msg['content']}")
 
             return " | ".join(prompt_parts)
-        
+
         # Hack -- otherwise we need to know if we are in training or validation.
         assert self.num_generations_per_prompt == self.num_val_generations_per_prompt
 
@@ -531,10 +542,13 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
         observations = []
         all_metadata = []
         rewards_list = []
-        
+
+        to_dump = []
+        timestamp = time.time()
+
         for i, (conversation, single_metadata) in enumerate(zip(message_log_batch, metadata)):
             prompt_key = prompt_keys[i]
-            
+
             # Find which response index this is within its group
             group_indices = prompt_groups[prompt_key]["indices"]
             response_idx_in_group = group_indices.index(i)
@@ -554,6 +568,11 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
             all_metadata.append(single_metadata)
             rewards_list.append(score)
 
+        if (dump_path := os.getenv("GENRM_DUMP_DATA_PATH")) is not None:
+            to_dump = sorted(to_dump, key = lambda x: (x["prompt_key"], -x["score"]))
+            with jsonlines.open(dump_path, mode="a") as writer:
+                writer.write_all(to_dump)
+
         rewards_tensor = torch.tensor(rewards_list, dtype=torch.float32).cpu()
         terminateds_tensor = torch.ones_like(rewards_tensor).cpu()
         next_stop_strings = [None] * len(rewards_list)
@@ -567,9 +586,7 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
             answers=None,  # GenRM RLHF doesn't extract specific answers
         )
 
-    def global_post_process_and_metrics(
-        self, batch: BatchedDataDict
-    ) -> Tuple[BatchedDataDict, dict]:
+    def global_post_process_and_metrics(self, batch: BatchedDataDict) -> Tuple[BatchedDataDict, dict]:
         """Computes metrics for the GenRM pairwise environment."""
         metrics = {}
 
