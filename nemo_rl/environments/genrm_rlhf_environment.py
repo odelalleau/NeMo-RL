@@ -13,10 +13,13 @@
 # limitations under the License.
 import logging
 import os
+import time
 import uuid
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, TypedDict, Any
 import itertools
+
+import jsonlines
 
 import ray
 import torch
@@ -40,7 +43,9 @@ class GenRMRLHFConfig(TypedDict):
     gpu_memory_utilization: float
     max_model_len: int
     num_generations_per_prompt: int  # e.g., 8 - number of responses to generate per prompt during training
-    num_val_generations_per_prompt: Optional[int]  # Number of responses per prompt during validation (defaults to num_generations_per_prompt)
+    num_val_generations_per_prompt: Optional[
+        int
+    ]  # Number of responses per prompt during validation (defaults to num_generations_per_prompt)
     # Default sampling parameters for the GenRM
     temperature: Optional[float]
     top_p: Optional[float]
@@ -76,11 +81,9 @@ class AsyncGenRMWorker:
     ):
         # Configure logging for Ray worker
         logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            force=True
+            level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", force=True
         )
-        
+
         # Imports moved here to be within the Ray actor's context
         from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
         from vllm.engine.arg_utils import AsyncEngineArgs
@@ -91,15 +94,13 @@ class AsyncGenRMWorker:
 
         self.SamplingParams = SamplingParams
         self.TokensPrompt = TokensPrompt
-        
+
         # Setup HF cache path
         hf_home_cache_path = os.environ.get("HF_HOME", HUGGINGFACE_HUB_CACHE)
         if not os.path.isdir(hf_home_cache_path):
             try:
                 os.makedirs(hf_home_cache_path, exist_ok=True)
-                logging.info(
-                    f"Created HF cache directory for GenRM worker: {hf_home_cache_path}"
-                )
+                logging.info(f"Created HF cache directory for GenRM worker: {hf_home_cache_path}")
             except OSError as e:
                 logging.warning(
                     f"GenRM worker could not create HF cache directory {hf_home_cache_path}: {e}. "
@@ -112,7 +113,7 @@ class AsyncGenRMWorker:
             cache_dir=hf_home_cache_path,
             trust_remote_code=True,
         )
-        
+
         # Initialize AsyncEngine with GenRM model
         engine_args = AsyncEngineArgs(
             model=model_name,
@@ -135,21 +136,15 @@ class AsyncGenRMWorker:
         logging.info(f"AsyncGenRMWorker initialized with GenRM model: {model_name}")
 
     def _format_genrm_messages(
-        self,
-        conversation_history: List[Dict[str, str]], 
-        response_1: str, 
-        response_2: str
+        self, conversation_history: List[Dict[str, str]], response_1: str, response_2: str
     ) -> List[Dict[str, str]]:
         """Format the conversation and responses into GenRM's expected message format."""
         # Build messages list in the format expected by GenRM
         messages = conversation_history.copy()
-        
+
         # Add the responses to be compared
-        messages.extend([
-            {"role": "response_1", "content": response_1},
-            {"role": "response_2", "content": response_2}
-        ])
-        
+        messages.extend([{"role": "response_1", "content": response_1}, {"role": "response_2", "content": response_2}])
+
         return messages
 
     async def compare_responses(
@@ -166,7 +161,7 @@ class AsyncGenRMWorker:
             request_id: Unique ID for this comparison request
             conversation_history: List of conversation messages in user/assistant format
             response_1: First response to compare
-            response_2: Second response to compare  
+            response_2: Second response to compare
             sampling_params_dict: Parameters for vLLM sampling
 
         Returns:
@@ -179,16 +174,16 @@ class AsyncGenRMWorker:
             if self.reasoning_split_word and self.reasoning_split_word in response_2:
                 response_2 = response_2.split(self.reasoning_split_word)[-1].lstrip()
             messages = self._format_genrm_messages(conversation_history, response_1, response_2)
-            
+
             # Apply chat template to get text for debugging
             chat_template_text = self.tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
             )
-            
+
             # logging.info(f"GenRM chat template text for {request_id}:\n{chat_template_text}")
-            
+
             # Apply chat template and tokenize
             token_ids = self.tokenizer.apply_chat_template(
                 messages,
@@ -196,39 +191,41 @@ class AsyncGenRMWorker:
                 add_generation_prompt=True,
                 return_tensors=None,  # Return list of token IDs
             )
-            
+
             # logging.info(f"GenRM tokenized prompt for {request_id}: {len(token_ids)} tokens")
-            
+
             # Create sampling parameters
             sampling_params = self.SamplingParams(**sampling_params_dict)
-            
+
             # Create TokensPrompt object for vLLM
             tokens_prompt = self.TokensPrompt(prompt_token_ids=token_ids)
-            
+
             # Generate using AsyncEngine with TokensPrompt
             results_generator = self.engine.generate(tokens_prompt, sampling_params, request_id)
-            
+
             final_output = None
             async for request_output in results_generator:
                 final_output = request_output
-            
+
             if final_output and final_output.outputs:
                 generated_text = final_output.outputs[0].text.strip()
-                
+
                 # Split by reasoning word if provided
                 if self.reasoning_split_word and self.reasoning_split_word in generated_text:
                     generated_text = generated_text.split(self.reasoning_split_word)[-1].lstrip()
-                
+
                 # Parse the scores from GenRM output
                 individual_score_1, individual_score_2, ranking_score = self._parse_genrm_output(generated_text)
-                
-                logging.info(f"GenRM comparison {request_id}: scores=({individual_score_1}, {individual_score_2}), ranking={ranking_score}, generated_text={generated_text}")
-                
+
+                logging.info(
+                    f"GenRM comparison {request_id}: scores=({individual_score_1}, {individual_score_2}), ranking={ranking_score}, generated_text={generated_text}"
+                )
+
                 return request_id, individual_score_1, individual_score_2, ranking_score
             else:
                 logging.warning(f"No output received from GenRM for request {request_id}")
                 return request_id, 3.0, 3.0, 3.5
-                
+
         except Exception as e:
             logging.error(f"Error in GenRM comparison {request_id}: {e}")
             return request_id, 3.0, 3.0, 3.5
@@ -237,24 +234,24 @@ class AsyncGenRMWorker:
         """Parse GenRM output to extract individual and ranking scores from JSON format."""
         import re
         import json
-        
+
         try:
             # Try to find JSON in the response (same as vanilla GenRM)
             json_match = re.search(r"\{.*\}", output, re.DOTALL)
             if json_match:
                 json_str = json_match.group(0)
                 parsed = json.loads(json_str)
-                
+
                 score_1 = float(parsed.get("score_1", 3.0))
                 score_2 = float(parsed.get("score_2", 3.0))
                 ranking = float(parsed.get("ranking", 3.5))
-                
+
                 logging.debug(f"Extracted scores from JSON: score_1={score_1}, score_2={score_2}, ranking={ranking}")
                 return score_1, score_2, ranking
             else:
                 logging.warning(f"No JSON found in GenRM output: {output}...")
                 return 3.0, 3.0, 3.5  # Default neutral scores
-                
+
         except json.JSONDecodeError as e:
             logging.error(f"Failed to parse JSON from GenRM output: {e}. Output was: {output}...")
             return 3.0, 3.0, 3.5
@@ -266,7 +263,7 @@ class AsyncGenRMWorker:
 @ray.remote
 class GenRMRLHFEnvironment(EnvironmentInterface):
     """Environment that uses GenRM for pairwise comparison of multiple responses per prompt."""
-    
+
     DEFAULT_PY_EXECUTABLE = PY_EXECUTABLES.SYSTEM
 
     def __init__(self, cfg: GenRMRLHFConfig):
@@ -278,19 +275,19 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
         self.num_judges_per_comparison = int(cfg.get("num_judges_per_comparison", 1) or 1)
         if self.num_judges_per_comparison < 1:
             raise ValueError("num_judges_per_comparison must be at least 1")
-        
+
         # Initialize the reward aggregator
         aggregator_method = cfg.get("aggregator_method", "simple_tiebreaker")  # Default to simple_tiebreaker
         aggregator_config = cfg.get("aggregator_config", {})
         self.reward_aggregator = create_aggregator(aggregator_method, **aggregator_config)
         logging.info(f"Initialized GenRM environment with {self.reward_aggregator.name} aggregator")
-        
+
         tensor_parallel_size = cfg.get("tensor_parallel_size", 1)
 
         # Create RayVirtualCluster for GPU allocation if needed
         if tensor_parallel_size == 1:
             bundle_ct_per_node_list = [tensor_parallel_size] * self.num_workers
-            
+
             self.virtual_cluster = RayVirtualCluster(
                 bundle_ct_per_node_list=bundle_ct_per_node_list,
                 use_gpus=True,
@@ -306,14 +303,14 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
         env_vars_to_pass = {}
         for key in [
             "HF_HOME",
-            "TRANSFORMERS_CACHE", 
+            "TRANSFORMERS_CACHE",
             "WANDB_API_KEY",
             "HUGGINGFACE_HUB_DISABLE_XET",
             "HF_TOKEN",
         ]:
             if key in os.environ:
                 env_vars_to_pass[key] = os.environ[key]
-        
+
         env_vars_to_pass.setdefault("HUGGINGFACE_HUB_DISABLE_XET", "1")
 
         worker_options = {
@@ -329,7 +326,7 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
         for i in range(self.num_workers):
             if tensor_parallel_size == 1:
                 pg_index = i % len(placement_groups)
-                pg = placement_groups[pg_index] 
+                pg = placement_groups[pg_index]
                 scheduling_kwargs = dict(
                     scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
                         placement_group=pg
@@ -337,7 +334,7 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
                 )
             else:
                 scheduling_kwargs = {}
-                
+
             worker = AsyncGenRMWorker.options(
                 **worker_options,
                 **scheduling_kwargs,
@@ -349,11 +346,13 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
                 reasoning_split_word=cfg.get("reasoning_split_word", "</think>"),
             )
             self.workers.append(worker)
-            
+
         logging.info(f"Created {len(self.workers)} AsyncGenRMWorker actors.")
         self._request_counter = 0
         self._actor_id_prefix = str(uuid.uuid4())[:8]
-        self._last_additional_metrics = {}  # Store additional metrics from last step for global_post_process_and_metrics
+        self._last_additional_metrics = (
+            {}
+        )  # Store additional metrics from last step for global_post_process_and_metrics
 
     def shutdown(self):
         for worker in self.workers:
@@ -361,30 +360,38 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
         if self.virtual_cluster is not None:
             self.virtual_cluster.shutdown()
 
+    def get_response(self, conv) -> str:
+        assistant_msgs = [msg for msg in conv if msg["role"] == "assistant"]
+        assert assistant_msgs
+        resp = assistant_msgs[-1]["content"]
+        if "</think>" in resp:
+            resp = resp.rsplit("</think>", 1)[1].lstrip()
+        return resp
+
     def step(
         self,
         message_log_batch: List[List[Dict[str, str]]],
         metadata: List[GenRMEnvironmentMetadata],
     ) -> EnvironmentReturn:
         """Step function for GenRM pairwise comparison environment.
-        
+
         Args:
             message_log_batch: List of conversations, where each conversation is a list of messages
             metadata: List of metadata for each conversation
-            
+
         Returns:
             EnvironmentReturn with rewards based on pairwise comparison aggregation
         """
-        
+
         def get_prompt_key(conversation_history: List[Dict[str, str]]) -> str:
             """Extract the conversation history as a grouping key."""
             # Create a key from the conversation history (the prompt context)
             prompt_parts = []
             for msg in conversation_history:
                 prompt_parts.append(f"{msg['role']}: {msg['content']}")
-            
+
             return " | ".join(prompt_parts)
-        
+
         # Hack -- otherwise we need to know if we are in training or validation.
         assert self.num_generations_per_prompt == self.num_val_generations_per_prompt
 
@@ -397,11 +404,7 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
             prompt_key = f"{group_id[pk]} | {pk}"
             prompt_keys[i] = prompt_key
             if prompt_key not in prompt_groups:
-                prompt_groups[prompt_key] = {
-                    "conversations": [],
-                    "metadata": single_metadata,
-                    "indices": []
-                }
+                prompt_groups[prompt_key] = {"conversations": [], "metadata": single_metadata, "indices": []}
             prompt_groups[prompt_key]["conversations"].append(conversation)
             prompt_groups[prompt_key]["indices"].append(i)
             if len(prompt_groups[prompt_key]["conversations"]) == self.num_generations_per_prompt:
@@ -415,16 +418,18 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
             "max_tokens": self.cfg.get("max_tokens", 32768),
             "stop": self.cfg.get("stop", None),
         }
-        
+
         # Collect all pairwise comparison tasks
         comparison_futures = []
-        comparison_metadata = []  # Track which prompt group, response indices, and judge iteration each comparison belongs to
-        
+        comparison_metadata = (
+            []
+        )  # Track which prompt group, response indices, and judge iteration each comparison belongs to
+
         for prompt_key, group_data in prompt_groups.items():
             conversations = group_data["conversations"]
             group_metadata = group_data["metadata"]
             conversation_history = group_metadata["conversation_history"]
-            
+
             # Extract responses from conversations (assuming last message is assistant response)
             responses = []
             for conversation in conversations:
@@ -433,7 +438,7 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
                 assistant_msgs = [msg for msg in conversation if msg["role"] == "assistant"]
                 assert len(assistant_msgs) >= 1, "Each conversation should have at least one assistant message"
                 responses.append(assistant_msgs[-1]["content"])
-            
+
             # Check that we have the expected number of generations per prompt
             if len(responses) not in [self.num_generations_per_prompt, self.num_val_generations_per_prompt]:
                 raise ValueError(
@@ -441,8 +446,7 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
                     f"generations per prompt, but found {len(responses)} responses. "
                     f"This may be because generations for the same prompt are distributed to multiple dp ranks."
                 )
-            
-            
+
             # Generate all pairwise comparisons for this prompt group
             for judge_idx in range(self.num_judges_per_comparison):
                 for i, j in itertools.combinations(range(len(responses)), 2):
@@ -451,7 +455,7 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
                         f"_r{i}_r{j}_judge{judge_idx}"
                     )
                     worker_idx = len(comparison_futures) % self.num_workers
-                    
+
                     future = self.workers[worker_idx].compare_responses.remote(
                         request_id,
                         conversation_history,
@@ -461,51 +465,66 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
                     )
                     comparison_futures.append(future)
                     comparison_metadata.append((prompt_key, i, j, judge_idx))
-        
+
         self._request_counter += 1
-        
+
         # Get all comparison results
         comparison_results = ray.get(comparison_futures)
-        
+
         # Aggregate pairwise comparisons into final scores for each response using the configured aggregator
-        final_scores = self.reward_aggregator.aggregate_scores(
-            comparison_results, comparison_metadata, prompt_groups
-        )
-        
+        final_scores = self.reward_aggregator.aggregate_scores(comparison_results, comparison_metadata, prompt_groups)
+
         # Get additional metrics from the aggregator (e.g., individual scores for ranking-based aggregators)
         self._last_additional_metrics = self.reward_aggregator.get_additional_metrics(
             comparison_results, comparison_metadata, prompt_groups, final_scores
         )
-        
+
         # Create observations and prepare return values in the same order as input
         observations = []
         all_metadata = []
         rewards_list = []
-        
+
+        to_dump = []
+        timestamp = time.time()
+
         for i, (conversation, single_metadata) in enumerate(zip(message_log_batch, metadata)):
             prompt_key = prompt_keys[i]
-            
+
             # Find which response index this is within its group
             group_indices = prompt_groups[prompt_key]["indices"]
             response_idx_in_group = group_indices.index(i)
-            
+
             # Get the score for this response (default to 0.5 if no comparisons were made)
             if prompt_key in final_scores:
                 score = final_scores[prompt_key][response_idx_in_group]
             else:
                 score = 0.5  # Neutral score for single responses
-            
-            observations.append({
-                "role": "environment", 
-                "content": f"Environment: {self.reward_aggregator.name} Score = {score:.3f}"
-            })
+
+            if prompt_key.startswith("0"):
+                to_dump.append(
+                    {
+                        "prompt_key": prompt_key,
+                        "score": score,
+                        "response": self.get_response(conversation),
+                        "timestamp": timestamp,
+                    }
+                )
+
+            observations.append(
+                {"role": "environment", "content": f"Environment: {self.reward_aggregator.name} Score = {score:.3f}"}
+            )
             all_metadata.append(single_metadata)
             rewards_list.append(score)
-        
+
+        if (dump_path := os.getenv("GENRM_DUMP_DATA_PATH")) is not None:
+            to_dump = sorted(to_dump, key = lambda x: (x["prompt_key"], -x["score"]))
+            with jsonlines.open(dump_path, mode="a") as writer:
+                writer.write_all(to_dump)
+
         rewards_tensor = torch.tensor(rewards_list, dtype=torch.float32).cpu()
         terminateds_tensor = torch.ones_like(rewards_tensor).cpu()
         next_stop_strings = [None] * len(rewards_list)
-        
+
         return EnvironmentReturn(
             observations=observations,
             metadata=all_metadata,
@@ -515,13 +534,11 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
             answers=None,  # GenRM RLHF doesn't extract specific answers
         )
 
-    def global_post_process_and_metrics(
-        self, batch: BatchedDataDict
-    ) -> Tuple[BatchedDataDict, dict]:
+    def global_post_process_and_metrics(self, batch: BatchedDataDict) -> Tuple[BatchedDataDict, dict]:
         """Computes metrics for the GenRM pairwise environment."""
-        
+
         metrics = {}
-        
+
         # Add additional metrics from the aggregator (e.g., individual scores for ranking-based aggregators)
         if self._last_additional_metrics:
             metrics.update(self._last_additional_metrics)
