@@ -12,14 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
+import json
 import logging
 import os
 import time
 import uuid
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
-
-import jsonlines
 
 import ray
 import torch
@@ -569,9 +568,10 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
             rewards_list.append(score)
 
         if (dump_path := os.getenv("GENRM_DUMP_DATA_PATH")) is not None:
-            to_dump = sorted(to_dump, key = lambda x: (x["prompt_key"], -x["score"]))
-            with jsonlines.open(dump_path, mode="a") as writer:
-                writer.write_all(to_dump)
+            to_dump = sorted(to_dump, key=lambda x: (x["prompt_key"], -x["score"]))
+            with open(dump_path, "a", encoding="utf_8") as writer:
+                for item in to_dump:
+                    writer.write(json.dumps(item, ensure_ascii=False) + "\n")
 
         rewards_tensor = torch.tensor(rewards_list, dtype=torch.float32).cpu()
         terminateds_tensor = torch.ones_like(rewards_tensor).cpu()
