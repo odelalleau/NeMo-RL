@@ -14,6 +14,7 @@
 import logging
 import os
 import uuid
+from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, TypedDict, Any
 import itertools
 
@@ -384,10 +385,17 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
             
             return " | ".join(prompt_parts)
         
+        # Hack -- otherwise we need to know if we are in training or validation.
+        assert self.num_generations_per_prompt == self.num_val_generations_per_prompt
+
         # Group responses by prompt (conversation history from metadata)
         prompt_groups = {}
+        group_id = defaultdict(int)
+        prompt_keys = {}
         for i, (conversation, single_metadata) in enumerate(zip(message_log_batch, metadata)):
-            prompt_key = get_prompt_key(single_metadata["conversation_history"])
+            pk = get_prompt_key(single_metadata["conversation_history"])
+            prompt_key = f"{group_id[pk]} | {pk}"
+            prompt_keys[i] = prompt_key
             if prompt_key not in prompt_groups:
                 prompt_groups[prompt_key] = {
                     "conversations": [],
@@ -396,7 +404,10 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
                 }
             prompt_groups[prompt_key]["conversations"].append(conversation)
             prompt_groups[prompt_key]["indices"].append(i)
-        
+            if len(prompt_groups[prompt_key]["conversations"]) == self.num_generations_per_prompt:
+                # Group is complete! => increase group ID.
+                group_id[pk] += 1
+
         # Prepare default sampling parameters
         default_sampling_params = {
             "temperature": self.cfg.get("temperature", 0.0),
@@ -472,7 +483,7 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
         rewards_list = []
         
         for i, (conversation, single_metadata) in enumerate(zip(message_log_batch, metadata)):
-            prompt_key = get_prompt_key(single_metadata["conversation_history"])
+            prompt_key = prompt_keys[i]
             
             # Find which response index this is within its group
             group_indices = prompt_groups[prompt_key]["indices"]
