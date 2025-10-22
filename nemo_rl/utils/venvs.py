@@ -98,9 +98,9 @@ def create_local_venv(py_executable: str, venv_name: str, force_rebuild: bool = 
     subprocess.run(["uv", "sync"], env=env, check=True)
     proc = subprocess.run(exec_cmd, env=env, check=False, capture_output=True, text=True)
     if proc.returncode == 0:
-        print(f"Command successful: {exec_cmd}\nSTDERR: {proc.stderr}\nSTDOUT: {proc.stdout}")
+        logger.info(f"Command successful: {exec_cmd}\nSTDERR: {proc.stderr}\nSTDOUT: {proc.stdout}")
     else:
-        print(f"Command failed ({proc.returncode}): {exec_cmd}\nSTDERR: {proc.stderr}\nSTDOUT: {proc.stdout}")
+        logger.info(f"Command failed ({proc.returncode}): {exec_cmd}\nSTDERR: {proc.stderr}\nSTDOUT: {proc.stdout}")
         proc.check_returncode()
 
     # # Copy venv to somewhere we can re-use it later.
