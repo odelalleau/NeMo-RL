@@ -34,15 +34,11 @@ from nemo_rl.environments.pairwise_reward_aggregators import create_aggregator
 
 class GenRMRLHFConfig(TypedDict):
     num_workers: int
-    model_name: (
-        str  # GenRM model name, e.g., "nvidia/Llama-3_3-Nemotron-Super-49B-GenRM"
-    )
+    model_name: str  # GenRM model name, e.g., "nvidia/Llama-3_3-Nemotron-Super-49B-GenRM"
     tensor_parallel_size: int
     gpu_memory_utilization: float
     max_model_len: int
-    num_generations_per_prompt: (
-        int  # e.g., 8 - number of responses to generate per prompt during training
-    )
+    num_generations_per_prompt: int  # e.g., 8 - number of responses to generate per prompt during training
     num_val_generations_per_prompt: Optional[
         int
     ]  # Number of responses per prompt during validation (defaults to num_generations_per_prompt)
@@ -51,24 +47,16 @@ class GenRMRLHFConfig(TypedDict):
     top_p: Optional[float]
     max_tokens: Optional[int]
     stop: Optional[List[str]]
-    max_concurrency: Optional[
-        int
-    ]  # Maximum concurrent step calls for the environment actor
+    max_concurrency: Optional[int]  # Maximum concurrent step calls for the environment actor
     reasoning_split_word: Optional[str]  # Default: "</think>"
     # Reward aggregation configuration
-    aggregator_method: Optional[
-        str
-    ]  # e.g., "individual_scores", "weighted_win_loss", "simple_tiebreaker", etc.
+    aggregator_method: Optional[str]  # e.g., "individual_scores", "weighted_win_loss", "simple_tiebreaker", etc.
     aggregator_config: Optional[Dict[str, Any]]  # Additional config for the aggregator
-    num_judges_per_comparison: Optional[
-        int
-    ]  # Number of times to evaluate each response pair (majority voting)
+    num_judges_per_comparison: Optional[int]  # Number of times to evaluate each response pair (majority voting)
 
 
 class GenRMEnvironmentMetadata(TypedDict):
-    conversation_history: List[
-        Dict[str, str]
-    ]  # The conversation history in user/assistant format
+    conversation_history: List[Dict[str, str]]  # The conversation history in user/assistant format
 
 
 @ray.remote
@@ -191,9 +179,7 @@ class AsyncGenRMWorker:
                 response_1 = response_1.split(self.reasoning_split_word)[-1].lstrip().replace("<|im_end|>", "")
             if self.reasoning_split_word and self.reasoning_split_word in response_2:
                 response_2 = response_2.split(self.reasoning_split_word)[-1].lstrip().replace("<|im_end|>", "")
-            messages = self._format_genrm_messages(
-                conversation_history, response_1, response_2
-            )
+            messages = self._format_genrm_messages(conversation_history, response_1, response_2)
 
             # Apply chat template to get text for debugging
             chat_template_text = self.tokenizer.apply_chat_template(
@@ -221,9 +207,7 @@ class AsyncGenRMWorker:
             tokens_prompt = self.TokensPrompt(prompt_token_ids=token_ids)
 
             # Generate using AsyncEngine with TokensPrompt
-            results_generator = self.engine.generate(
-                tokens_prompt, sampling_params, request_id
-            )
+            results_generator = self.engine.generate(tokens_prompt, sampling_params, request_id)
 
             final_output = None
             async for request_output in results_generator:
@@ -233,18 +217,11 @@ class AsyncGenRMWorker:
                 generated_text = final_output.outputs[0].text.strip()
 
                 # Split by reasoning word if provided
-                if (
-                    self.reasoning_split_word
-                    and self.reasoning_split_word in generated_text
-                ):
-                    generated_text = generated_text.split(self.reasoning_split_word)[
-                        -1
-                    ].lstrip()
+                if self.reasoning_split_word and self.reasoning_split_word in generated_text:
+                    generated_text = generated_text.split(self.reasoning_split_word)[-1].lstrip()
 
                 # Parse the scores from GenRM output
-                individual_score_1, individual_score_2, ranking_score = (
-                    self._parse_genrm_output(generated_text)
-                )
+                individual_score_1, individual_score_2, ranking_score = self._parse_genrm_output(generated_text)
 
                 logging.info(
                     f"GenRM comparison {request_id}: scores=({individual_score_1}, {individual_score_2}), ranking={ranking_score}, generated_text={generated_text}"
@@ -252,9 +229,7 @@ class AsyncGenRMWorker:
 
                 return request_id, individual_score_1, individual_score_2, ranking_score
             else:
-                logging.warning(
-                    f"No output received from GenRM for request {request_id}"
-                )
+                logging.warning(f"No output received from GenRM for request {request_id}")
                 return request_id, 3.0, 3.0, 3.5
 
         except Exception as e:
@@ -277,18 +252,14 @@ class AsyncGenRMWorker:
                 score_2 = float(parsed.get("score_2", 3.0))
                 ranking = float(parsed.get("ranking", 3.5))
 
-                logging.debug(
-                    f"Extracted scores from JSON: score_1={score_1}, score_2={score_2}, ranking={ranking}"
-                )
+                logging.debug(f"Extracted scores from JSON: score_1={score_1}, score_2={score_2}, ranking={ranking}")
                 return score_1, score_2, ranking
             else:
                 logging.warning(f"No JSON found in GenRM output: {output}...")
                 return 3.0, 3.0, 3.5  # Default neutral scores
 
         except json.JSONDecodeError as e:
-            logging.error(
-                f"Failed to parse JSON from GenRM output: {e}. Output was: {output}..."
-            )
+            logging.error(f"Failed to parse JSON from GenRM output: {e}. Output was: {output}...")
             return 3.0, 3.0, 3.5
         except Exception as e:
             logging.error(f"Error parsing GenRM output: {e}. Output was: {output}...")
@@ -306,26 +277,16 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
         self.num_workers = cfg["num_workers"]
         self.num_generations_per_prompt = cfg["num_generations_per_prompt"]
         # If validation generations not specified, default to training value
-        self.num_val_generations_per_prompt = cfg.get(
-            "num_val_generations_per_prompt", self.num_generations_per_prompt
-        )
-        self.num_judges_per_comparison = int(
-            cfg.get("num_judges_per_comparison", 1) or 1
-        )
+        self.num_val_generations_per_prompt = cfg.get("num_val_generations_per_prompt", self.num_generations_per_prompt)
+        self.num_judges_per_comparison = int(cfg.get("num_judges_per_comparison", 1) or 1)
         if self.num_judges_per_comparison < 1:
             raise ValueError("num_judges_per_comparison must be at least 1")
 
         # Initialize the reward aggregator
-        aggregator_method = cfg.get(
-            "aggregator_method", "simple_tiebreaker"
-        )  # Default to simple_tiebreaker
+        aggregator_method = cfg.get("aggregator_method", "simple_tiebreaker")  # Default to simple_tiebreaker
         aggregator_config = cfg.get("aggregator_config", {})
-        self.reward_aggregator = create_aggregator(
-            aggregator_method, **aggregator_config
-        )
-        logging.info(
-            f"Initialized GenRM environment with {self.reward_aggregator.name} aggregator"
-        )
+        self.reward_aggregator = create_aggregator(aggregator_method, **aggregator_config)
+        logging.info(f"Initialized GenRM environment with {self.reward_aggregator.name} aggregator")
 
         tensor_parallel_size = cfg.get("tensor_parallel_size", 1)
 
@@ -470,7 +431,9 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
 
         # Collect all pairwise comparison tasks
         comparison_futures = []
-        comparison_metadata = []  # Track which prompt group, response indices, and judge iteration each comparison belongs to
+        comparison_metadata = (
+            []
+        )  # Track which prompt group, response indices, and judge iteration each comparison belongs to
 
         for prompt_key, group_data in prompt_groups.items():
             conversations = group_data["conversations"]
@@ -480,16 +443,10 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
             # Extract responses from conversations (assuming last message is assistant response)
             responses = []
             for conversation in conversations:
-                assert len(conversation) >= 1, (
-                    "Each conversation should have at least one message"
-                )
+                assert len(conversation) >= 1, "Each conversation should have at least one message"
                 # Get the last assistant message as the response
-                assistant_msgs = [
-                    msg for msg in conversation if msg["role"] == "assistant"
-                ]
-                assert len(assistant_msgs) >= 1, (
-                    "Each conversation should have at least one assistant message"
-                )
+                assistant_msgs = [msg for msg in conversation if msg["role"] == "assistant"]
+                assert len(assistant_msgs) >= 1, "Each conversation should have at least one assistant message"
                 responses.append(assistant_msgs[-1]["content"])
 
             # Check that we have the expected number of generations per prompt
@@ -528,9 +485,7 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
         comparison_results = ray.get(comparison_futures)
 
         # Aggregate pairwise comparisons into final scores for each response using the configured aggregator
-        final_scores = self.reward_aggregator.aggregate_scores(
-            comparison_results, comparison_metadata, prompt_groups
-        )
+        final_scores = self.reward_aggregator.aggregate_scores(comparison_results, comparison_metadata, prompt_groups)
 
         # Get additional metrics from the aggregator (e.g., individual scores for ranking-based aggregators)
         self._last_additional_metrics = self.reward_aggregator.get_additional_metrics(
@@ -557,7 +512,6 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
                 score = final_scores[prompt_key][response_idx_in_group]
             else:
                 score = 0.5  # Neutral score for single responses
-
             observations.append(
                 {
                     "role": "environment",
