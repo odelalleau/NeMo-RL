@@ -14,6 +14,7 @@
 import logging
 import os
 import shlex
+import shutil
 import subprocess
 import time
 from functools import lru_cache
@@ -67,8 +68,6 @@ def create_local_venv(py_executable: str, venv_name: str, force_rebuild: bool = 
     # Force rebuild if requested
     if force_rebuild and os.path.exists(venv_path):
         logger.info(f"Force rebuilding venv at {venv_path}")
-        import shutil
-
         shutil.rmtree(venv_path)
 
     logger.info(f"Creating new venv at {venv_path}")
@@ -99,10 +98,18 @@ def create_local_venv(py_executable: str, venv_name: str, force_rebuild: bool = 
     subprocess.run(["uv", "sync"], env=env, check=True)
     proc = subprocess.run(exec_cmd, env=env, check=False, capture_output=True, text=True)
     if proc.returncode == 0:
-        logger.info(f"Command successful: {exec_cmd}\nSTDERR: {proc.stderr}\nSTDOUT: {proc.stdout}")
+        print(f"Command successful: {exec_cmd}\nSTDERR: {proc.stderr}\nSTDOUT: {proc.stdout}")
     else:
-        logger.error(f"Command failed ({proc.returncode}): {exec_cmd}\nSTDERR: {proc.stderr}\nSTDOUT: {proc.stdout}")
+        print(f"Command failed ({proc.returncode}): {exec_cmd}\nSTDERR: {proc.stderr}\nSTDOUT: {proc.stdout}")
         proc.check_returncode()
+
+    # Copy venv to somewhere we can re-use it later.
+    if (data_dir_env := os.getenv("DATA_DIR")) is not None:
+        data_dir = Path(data_dir_env)
+        venv_copy_path = data_dir / "venvs" / Path(venv_path).name
+        if not venv_copy_path.exists():
+            logger.info(f"Copying venv to {venv_copy_path} for future re-use.")
+            shutil.copytree(venv_path, venv_copy_path)
 
     # Return the path to the python executable in the virtual environment
     python_path = os.path.join(venv_path, "bin", "python")
