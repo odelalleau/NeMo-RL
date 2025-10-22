@@ -198,7 +198,7 @@ class AsyncGenRMWorker:
                 return_tensors=None,  # Return list of token IDs
             )
 
-            # logging.info(f"GenRM tokenized prompt for {request_id}: {len(token_ids)} tokens")
+            logging.info(f"GenRM tokenized prompt for {request_id}: {len(token_ids)} tokens")
 
             # Create sampling parameters
             sampling_params = self.SamplingParams(**sampling_params_dict)
