@@ -143,6 +143,10 @@ class AsyncGenRMWorker:
         # Build messages list in the format expected by GenRM
         messages = conversation_history.copy()
 
+        # Ensure no <|im_end|> tokens in responses (final cleanup)
+        response_1 = response_1.replace("<|im_end|>", "")
+        response_2 = response_2.replace("<|im_end|>", "")
+
         # Add the responses to be compared
         messages.extend(
             [
@@ -174,12 +178,16 @@ class AsyncGenRMWorker:
             Tuple of (request_id, individual_score_1, individual_score_2, ranking_score)
         """
         try:
-            # Format messages for GenRM
+            # Handle reasoning split if applicable
             if self.reasoning_split_word and self.reasoning_split_word in response_1:
-                response_1 = response_1.split(self.reasoning_split_word)[-1].lstrip().replace("<|im_end|>", "")
+                response_1 = response_1.split(self.reasoning_split_word)[-1].lstrip()
             if self.reasoning_split_word and self.reasoning_split_word in response_2:
-                response_2 = response_2.split(self.reasoning_split_word)[-1].lstrip().replace("<|im_end|>", "")
-            messages = self._format_genrm_messages(conversation_history, response_1, response_2)
+                response_2 = response_2.split(self.reasoning_split_word)[-1].lstrip()
+            
+            # Format messages for GenRM (this will clean up <|im_end|> tokens)
+            messages = self._format_genrm_messages(
+                conversation_history, response_1, response_2
+            )
 
             # Apply chat template to get text for debugging
             chat_template_text = self.tokenizer.apply_chat_template(
