@@ -30,9 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=None)
-def create_local_venv(
-    py_executable: str, venv_name: str, force_rebuild: bool = False
-) -> str:
+def create_local_venv(py_executable: str, venv_name: str, force_rebuild: bool = False) -> str:
     """Create a virtual environment using uv and execute a command within it.
 
     The output can be used as a py_executable for a Ray worker assuming the worker
@@ -57,9 +55,7 @@ def create_local_venv(
     #
     # You can override this location by setting the NEMO_RL_VENV_DIR environment variable
 
-    NEMO_RL_VENV_DIR = os.path.normpath(
-        os.environ.get("NEMO_RL_VENV_DIR", DEFAULT_VENV_DIR)
-    )
+    NEMO_RL_VENV_DIR = os.path.normpath(os.environ.get("NEMO_RL_VENV_DIR", DEFAULT_VENV_DIR))
     logger.info(f"NEMO_RL_VENV_DIR is set to {NEMO_RL_VENV_DIR}.")
 
     # Create the venv directory if it doesn't exist
@@ -95,9 +91,18 @@ def create_local_venv(
     exec_cmd.extend(["echo", f"Finished creating venv {venv_path}"])
 
     # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
-    subprocess.run("uv pip install setuptools setuptools_scm torch==2.8.0 --torch-backend=cu128".split(), env=env | {"VIRTUAL_ENV": venv_path}, check=True)
+    subprocess.run(
+        "uv pip install setuptools setuptools_scm torch==2.8.0 --torch-backend=cu128".split(),
+        env=env | {"VIRTUAL_ENV": venv_path},
+        check=True,
+    )
     subprocess.run(["uv", "sync"], env=env, check=True)
-    subprocess.run(exec_cmd, env=env, check=True)
+    proc = subprocess.run(exec_cmd, env=env, check=False, capture_output=True, text=True)
+    if proc.returncode == 0:
+        logger.info(f"Command successful: {exec_cmd}\nSTDERR: {proc.stderr}\nSTDOUT: {proc.stdout}")
+    else:
+        logger.error(f"Command failed ({proc.returncode}): {exec_cmd}\nSTDERR: {proc.stderr}\nSTDOUT: {proc.stdout}")
+        proc.check_returncode()
 
     # Return the path to the python executable in the virtual environment
     python_path = os.path.join(venv_path, "bin", "python")
@@ -106,13 +111,9 @@ def create_local_venv(
 
 # Ray-based helper to create a virtual environment on each Ray node
 @ray.remote(num_cpus=1)  # pragma: no cover
-def _env_builder(
-    py_executable: str, venv_name: str, node_idx: int, force_rebuild: bool = False
-):
+def _env_builder(py_executable: str, venv_name: str, node_idx: int, force_rebuild: bool = False):
     # Check if another node is already building
-    NEMO_RL_VENV_DIR = os.path.normpath(
-        os.environ.get("NEMO_RL_VENV_DIR", DEFAULT_VENV_DIR)
-    )
+    NEMO_RL_VENV_DIR = os.path.normpath(os.environ.get("NEMO_RL_VENV_DIR", DEFAULT_VENV_DIR))
     venv_path = Path(NEMO_RL_VENV_DIR) / venv_name
     python_path = venv_path / "bin" / "python"
     started_file = venv_path / "STARTED_ENV_BUILDER"
@@ -127,9 +128,7 @@ def _env_builder(
 
     if started_file.exists():
         # Another node is already building, wait for completion
-        logger.info(
-            f"Node {node_idx}: Another node is building {venv_name}, skipping..."
-        )
+        logger.info(f"Node {node_idx}: Another node is building {venv_name}, skipping...")
         # Wait for the venv to be ready (check for python executable)
         python_path = venv_path / "bin" / "python"
         while not python_path.exists():
@@ -161,7 +160,7 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
         str: Path to the python executable in the created virtual environment
     """
     import sys
-    
+
     # Determine the number of alive Ray nodes
     nodes = [n for n in ray.nodes() if n.get("Alive", False)]
     num_nodes = len(nodes)
@@ -173,9 +172,7 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
     force_rebuild = os.environ.get("NRL_FORCE_REBUILD_VENVS", "false").lower() == "true"
     # Launch one actor per node
     actors = [
-        _env_builder.options(placement_group=pg).remote(
-            py_executable, venv_name, i, force_rebuild
-        )
+        _env_builder.options(placement_group=pg).remote(py_executable, venv_name, i, force_rebuild)
         for i, _ in enumerate(nodes)
     ]
     # ensure setup runs on each node
@@ -188,12 +185,10 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
         except Exception:
             pass
         sys.exit(1)
-    
+
     # Normalize paths to handle double slashes and other path inconsistencies
     normalized_paths = [os.path.normpath(p) for p in paths]
-    assert len(set(normalized_paths)) == 1, (
-        f"All nodes should have the same venv, but got: {set(normalized_paths)}"
-    )
+    assert len(set(normalized_paths)) == 1, f"All nodes should have the same venv, but got: {set(normalized_paths)}"
 
     # Clean up the placement group
     ray.util.remove_placement_group(pg)
