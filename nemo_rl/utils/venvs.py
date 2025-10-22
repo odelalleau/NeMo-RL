@@ -103,14 +103,14 @@ def create_local_venv(py_executable: str, venv_name: str, force_rebuild: bool = 
         print(f"Command failed ({proc.returncode}): {exec_cmd}\nSTDERR: {proc.stderr}\nSTDOUT: {proc.stdout}")
         proc.check_returncode()
 
-    # Copy venv to somewhere we can re-use it later.
-    if (data_dir_env := os.getenv("DATA_DIR")) is not None:
-        data_dir = Path(data_dir_env)
-        venv_copy_path = data_dir / "venvs" / Path(venv_path).name
-        if not venv_copy_path.exists():
-            logger.info(f"Copying venv to {venv_copy_path} for future re-use.")
-            shutil.copytree(venv_path, venv_copy_path, symlinks=True)
-            logger.info(f"Done Copying venv to {venv_copy_path}!")
+    # # Copy venv to somewhere we can re-use it later.
+    # if (data_dir_env := os.getenv("DATA_DIR")) is not None:
+    #     data_dir = Path(data_dir_env)
+    #     venv_copy_path = data_dir / "venvs" / Path(venv_path).name
+    #     if not venv_copy_path.exists():
+    #         logger.info(f"Copying venv to {venv_copy_path} for future re-use.")
+    #         shutil.copytree(venv_path, venv_copy_path, symlinks=True)
+    #         logger.info(f"Done Copying venv to {venv_copy_path}!")
 
     # Return the path to the python executable in the virtual environment
     python_path = os.path.join(venv_path, "bin", "python")
