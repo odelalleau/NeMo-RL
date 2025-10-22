@@ -110,6 +110,7 @@ def create_local_venv(py_executable: str, venv_name: str, force_rebuild: bool = 
         if not venv_copy_path.exists():
             logger.info(f"Copying venv to {venv_copy_path} for future re-use.")
             shutil.copytree(venv_path, venv_copy_path)
+            logger.info(f"Done Copying venv to {venv_copy_path}!")
 
     # Return the path to the python executable in the virtual environment
     python_path = os.path.join(venv_path, "bin", "python")
