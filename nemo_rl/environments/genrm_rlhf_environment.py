@@ -512,6 +512,17 @@ class GenRMRLHFEnvironment(EnvironmentInterface):
                 score = final_scores[prompt_key][response_idx_in_group]
             else:
                 score = 0.5  # Neutral score for single responses
+
+            if prompt_key.startswith("0"):
+                to_dump.append(
+                    {
+                        "prompt_key": prompt_key,
+                        "score": score,
+                        "response": self.get_response(conversation),
+                        "timestamp": timestamp,
+                    }
+                )
+
             observations.append(
                 {
                     "role": "environment",
