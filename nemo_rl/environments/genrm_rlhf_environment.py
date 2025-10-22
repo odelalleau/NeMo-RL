@@ -210,8 +210,11 @@ class AsyncGenRMWorker:
             results_generator = self.engine.generate(tokens_prompt, sampling_params, request_id)
 
             final_output = None
+            idx = 0
             async for request_output in results_generator:
+                logging.info(f"iterating on results_generator for {request_id} -- {idx=}")
                 final_output = request_output
+                idx += 1
 
             if final_output and final_output.outputs:
                 generated_text = final_output.outputs[0].text.strip()
