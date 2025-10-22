@@ -66,7 +66,7 @@ def create_local_venv(py_executable: str, venv_name: str, force_rebuild: bool = 
     venv_path = os.path.join(NEMO_RL_VENV_DIR, venv_name)
 
     # Force rebuild if requested
-    if force_rebuild and os.path.exists(venv_path):
+    if force_rebuild and os.path.exists(venv_path) and not os.getenv("GENRM_SKIP_VENV_REBUILD"):
         logger.info(f"Force rebuilding venv at {venv_path}")
         shutil.rmtree(venv_path)
 
