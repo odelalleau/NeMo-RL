@@ -24,6 +24,9 @@
 
 set -eoux pipefail
 
+# Record job-start epoch so Python can measure pre-Python overhead
+export NRL_JOB_START_EPOCH=$(date +%s.%N)
+
 ########################################################
 # Function to detect if SLURM cluster uses GRES
 ########################################################
@@ -606,6 +609,7 @@ while true; do
 done
 
 echo "All workers connected!"
+export NRL_RAY_READY_EPOCH=$(date +%s.%N)
 
 # We can now launch a job on this cluster
 # We do so by launching a driver process on the physical node that the head node is on
