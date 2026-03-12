@@ -1038,11 +1038,12 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                 "update_weights_via_ipc_zmq",
                 args=tuple(),
             )
-            worker_result = result_or_coro[0]
+            all_success = all([result[0] for result in result_or_coro])
+            exceptions_or_none = [result[1] for result in result_or_coro]
 
-            if not worker_result:
+            if not all_success:
                 print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                    f"Error: Worker failed to update weights. Result: {exceptions_or_none}"
                 )
                 return False
             return True
@@ -1069,11 +1070,12 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             result_or_coro = self.llm.collective_rpc(
                 "update_weights_from_collective", args=tuple()
             )
-            worker_result = result_or_coro[0]
+            all_success = all([result[0] for result in result_or_coro])
+            exceptions_or_none = [result[1] for result in result_or_coro]
 
-            if not worker_result:
+            if not all_success:
                 print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                    f"Error: Worker failed to update weights. Result: {exceptions_or_none}"
                 )
                 return False
             return True

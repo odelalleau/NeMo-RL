@@ -1203,12 +1203,13 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 worker_results = await result_or_coro
             else:
                 worker_results = result_or_coro
+            
+            all_success = all([result[0] for result in worker_results])
+            exceptions_or_none = [result[1] for result in worker_results]
 
-            worker_result = worker_results[0]
-
-            if not worker_result:
+            if not all_success:
                 print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                    f"Error: Worker failed to update weights. Result: {exceptions_or_none}"
                 )
                 return False
             return True
@@ -1240,11 +1241,12 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             else:
                 worker_results = result_or_coro
 
-            worker_result = worker_results[0]
+            all_success = all([result[0] for result in worker_results])
+            exceptions_or_none = [result[1] for result in worker_results]
 
-            if not worker_result:
+            if not all_success:
                 print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                    f"Error: Worker failed to update weights. Result: {exceptions_or_none}"
                 )
                 return False
             return True

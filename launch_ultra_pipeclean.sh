@@ -50,6 +50,71 @@ USE_WORKTREE="${USE_WORKTREE:-0}"
 INTERACTIVE="${INTERACTIVE:-0}"
 INTERACTIVE_WAIT="${INTERACTIVE_WAIT:-1}"
 
+# ---------- Precision configuration ------
+get_precision_config() {
+  local PRECISION_RECIPE="$1"
+  local DISABLE_FP8_LINEAR="$2"
+  local DISABLE_FP8_MOE="$3"
+  local ENABLE_FP8_PARAM_IN_TRAIN="$4"
+  local PRECISION_EXTRA_ARGS=""
+
+  MXFP8_GEN_EXTRA_ARGS="policy.generation.vllm_cfg.precision=fp8 \
+++policy.generation.vllm_cfg.fp8_cfg.is_mx=true \
+policy.generation.vllm_cfg.gpu_memory_utilization=0.8 \
+policy.generation.vllm_cfg.tensor_parallel_size=4 \
+policy.generation.vllm_cfg.expert_parallel_size=4"
+
+  IGNORED_LAYER_KWS="\"conv1d\",\"mtp\""
+  if [ "$DISABLE_FP8_MOE" == "1" ]; then
+  IGNORED_LAYER_KWS="$IGNORED_LAYER_KWS,\".experts.\""
+  fi
+  if [ "$DISABLE_FP8_LINEAR" == "1" ]; then
+  IGNORED_LAYER_KWS="$IGNORED_LAYER_KWS,\"in_proj\",\"out_proj\",\"q_proj\",\"k_proj\",\"v_proj\",\"o_proj\",\"fc1_latent_proj\",\"fc2_latent_proj\",\"shared_experts\""
+  fi
+  MXFP8_GEN_EXTRA_ARGS="$MXFP8_GEN_EXTRA_ARGS +policy.generation.vllm_cfg.quantization_ignored_layer_kws=[$IGNORED_LAYER_KWS]"
+
+  MXFP8_TRAIN_EXTRA_ARGS="policy.megatron_cfg.fp8_cfg.enabled=true \
+policy.megatron_cfg.fp8_cfg.fp8="e4m3" \
+policy.megatron_cfg.fp8_cfg.fp8_recipe="mxfp8" \
+++policy.megatron_cfg.fp8_cfg.fp8_param=false \
+policy.megatron_cfg.moe_router_dtype=fp32 \
+policy.megatron_cfg.expert_model_parallel_size=64 \
+"
+
+  MXFP8_PARAM_EXTRA_ARGS="++policy.megatron_cfg.fp8_cfg.fp8_param=true \
++policy.megatron_cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag=true \
++policy.megatron_cfg.optimizer.fp8_recipe=mxfp8 \
++policy.megatron_cfg.optimizer.overlap_param_gather=true \
+++policy.megatron_cfg.distributed_data_parallel_config.overlap_param_gather=true \
+++policy.megatron_cfg.distributed_data_parallel_config.overlap_grad_reduce=true \
+"
+
+  if [ "$ENABLE_FP8_PARAM_IN_TRAIN" == "1" ]; then
+  MXFP8_TRAIN_EXTRA_ARGS="$MXFP8_TRAIN_EXTRA_ARGS $MXFP8_PARAM_EXTRA_ARGS"
+  fi
+
+  if [ "$PRECISION_RECIPE" == "mxfp8-rollout" ]; then
+  PRECISION_EXTRA_ARGS="$MXFP8_GEN_EXTRA_ARGS"
+  elif [ "$PRECISION_RECIPE" == "mxfp8-train" ]; then
+  PRECISION_EXTRA_ARGS="$MXFP8_TRAIN_EXTRA_ARGS"
+  elif [ "$PRECISION_RECIPE" == "mxfp8-e2e" ]; then
+  PRECISION_EXTRA_ARGS="$MXFP8_GEN_EXTRA_ARGS $MXFP8_TRAIN_EXTRA_ARGS"
+  else
+  PRECISION_EXTRA_ARGS=""
+  fi
+
+  echo "${PRECISION_EXTRA_ARGS}"
+}
+
+PRECISION_RECIPE="${PRECISION_RECIPE:-bf16}"
+DISABLE_FP8_LINEAR="${DISABLE_FP8_LINEAR:-0}"
+DISABLE_FP8_MOE="${DISABLE_FP8_MOE:-0}"
+ENABLE_FP8_PARAM_IN_TRAIN="${ENABLE_FP8_PARAM_IN_TRAIN:-0}"
+PRECISION_EXTRA_ARGS=$(get_precision_config "${PRECISION_RECIPE}" "${DISABLE_FP8_LINEAR}" "${DISABLE_FP8_MOE}" "${ENABLE_FP8_PARAM_IN_TRAIN}")
+
+echo "PRECISION_RECIPE: ${PRECISION_RECIPE}"
+echo "PRECISION_EXTRA_ARGS: ${PRECISION_EXTRA_ARGS}"
+
 # ---------- SLURM configuration ----------
 SLURM_ACCOUNT="${SLURM_ACCOUNT:-llmservice_nemotron_ultra}"
 PARTITION="${PARTITION:-batch}"
@@ -57,7 +122,7 @@ SLURM_QOS="${SLURM_QOS:-}"
 WALLTIME="${WALLTIME:-4:00:00}"
 
 # ---------- Container & mounts ----------
-export CONTAINER="${CONTAINER:-/lustre/fs1/portfolios/llmservice/projects/llmservice_nemotron_ultra/users/ansubramania/containers/nemo-rl-ultra-vllm017-pipe45807540.sqsh}"
+export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nemotron_ultra/nemo_rl/images/pipe.45898348.sqsh}"
 MOUNTS="/lustre:/lustre"
 
 # GB200 NVL72: fixed at 4 GPUs/node. Must match --gres=gpu:4 passed to sbatch.
@@ -329,6 +394,7 @@ logger.wandb_enabled=True \
 logger.wandb.name=${WANDB_NAME} \
 logger.wandb.project=${WANDB_PROJ} \
 ${NRL_MAX_STEPS:+grpo.max_num_steps=${NRL_MAX_STEPS}} \
+${PRECISION_EXTRA_ARGS} \
 ${*}"
 
 
