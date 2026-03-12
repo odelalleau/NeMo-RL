@@ -123,7 +123,7 @@ class VllmInternalWorkerExtension:
         )
 
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
-    def update_weights_via_ipc_zmq(self) -> bool:
+    def update_weights_via_ipc_zmq(self) -> tuple[bool, Exception | None]:
         """Receive and update model weights via ZMQ IPC socket.
 
         Returns:
@@ -209,18 +209,18 @@ class VllmInternalWorkerExtension:
 
             gc.collect()
             torch.cuda.empty_cache()
-            return True
+            return True, None
         except Exception as e:
             print(
                 f"Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: {e}.\n"
                 f"{traceback.format_exc()}"
             )
-            return False
+            return False, e
 
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_collective"
     )
-    def update_weights_from_collective(self) -> bool:
+    def update_weights_from_collective(self) -> tuple[bool, Exception | None]:
         """Update the model weights from collective communication."""
         assert self.state_dict_info is not None, (
             "state_dict_info is not prepared. "
@@ -262,15 +262,24 @@ class VllmInternalWorkerExtension:
             self._maybe_process_drafter_weights_after_loading()
 
             # Process weights after loading for FP8 KV cache
+            from vllm.model_executor.model_loader.utils import (
+                process_weights_after_loading,
+            )
+
+            process_weights_after_loading(
+                self.model_runner.model, self.model_config, self.device
+            )
             self._maybe_process_fp8_kv_cache()
 
         except Exception as e:
             print(
                 f"Error in VllmInternalWorkerExtension.update_weights_from_collective: {e}"
             )
-            return False
+            return False, e
 
-        return True
+        gc.collect()
+        torch.cuda.empty_cache()
+        return True, None
 
     def _maybe_load_drafter_weights(self, weights) -> None:
         """Load weights into the drafter model (MTP) if present.
