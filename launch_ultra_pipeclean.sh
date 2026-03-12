@@ -125,6 +125,7 @@ export RAY_LOG_SYNC_FREQUENCY="${RAY_LOG_SYNC_FREQUENCY:-60}"
 EXP_SUFFIX="${EXP_SUFFIX:-ultra-v3-grpo-pipeclean}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-results/${EXP_SUFFIX}}"
 mkdir -p "${CHECKPOINT_DIR}"
+CHECKPOINT_DIR="$(cd "${CHECKPOINT_DIR}" && pwd)"
 
 # ---------- Code snapshot ----------
 # Batch mode: snapshot by default so code is frozen at submission time.
@@ -152,17 +153,19 @@ else
 fi
 
 # ---------- Persistent cache directories ----------
-# Shared project-level cache so all team members reuse compiled artifacts
-# (vLLM, FlashInfer cubins/workspace, Deep Gemm JIT, Triton, Inductor, uv).
+# Per-user cache for compiled artifacts (vLLM, FlashInfer cubins, Deep Gemm
+# JIT, Triton, Inductor, uv).  Each user gets their own directory to avoid
+# shared-permission issues on Lustre.
 #
-# Permission strategy:
-#   1. setgid (g+s)         → new files/dirs inherit the project group
-#   2. setfacl default ACLs → new files/dirs get group rwx regardless of
-#                              the creating process's umask. This propagates
-#                              to arbitrarily nested subdirectories (e.g.
-#                              FlashInfer's .cache/flashinfer/0.6.5/…) because
-#                              new directories inherit the parent's default ACL.
-PERSISTENT_CACHE="${PERSISTENT_CACHE:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nemotron_ultra/nemo_rl/persistent_cache}"
+# Default path: /lustre/fsw/portfolios/{access_group}/users/$USER/.cache
+# where {access_group} is the first segment of SLURM_ACCOUNT
+# (e.g. llmservice_nemotron_ultra → llmservice).
+#
+# Override with PERSISTENT_CACHE=/path/to/your/cache if needed.
+if [[ -z "${PERSISTENT_CACHE:-}" ]]; then
+  _access_group="${SLURM_ACCOUNT%%_*}"
+  PERSISTENT_CACHE="/lustre/fsw/portfolios/${_access_group}/users/${USER}/.cache/nemotron_ultra"
+fi
 VLLM_CACHE_DIR="${PERSISTENT_CACHE}/vllm_compile_cache"
 FLASHINFER_CUBIN_CACHE="${PERSISTENT_CACHE}/flashinfer_cubins"
 FLASHINFER_WS_BASE="${PERSISTENT_CACHE}/flashinfer_workspace"
@@ -171,23 +174,8 @@ LUSTRE_TRITON_CACHE="${PERSISTENT_CACHE}/triton_cache"
 INDUCTOR_CACHE_DIR="/tmp/nemo_rl_inductor_cache"
 TRITON_CACHE_DIR="/tmp/nemo_rl_triton_cache"
 
-# Validate group write access before proceeding.
-if ! touch "${PERSISTENT_CACHE}/.cache_write_test" 2>/dev/null; then
-  echo "ERROR: Cannot write to PERSISTENT_CACHE=${PERSISTENT_CACHE}"
-  echo "  You are likely not a member of the project access group."
-  echo "  Request access to join the llmservice DL, or override the cache directory with:"
-  echo "    PERSISTENT_CACHE=/path/to/your/cache bash ${0}"
-  exit 1
-fi
-rm -f "${PERSISTENT_CACHE}/.cache_write_test"
-
-_CACHE_DIRS=("${PERSISTENT_CACHE}" "${VLLM_CACHE_DIR}" "${FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}" \
-  "${LUSTRE_INDUCTOR_CACHE}" "${LUSTRE_TRITON_CACHE}")
-mkdir -p "${_CACHE_DIRS[@]}"
-chmod g+rwxs "${_CACHE_DIRS[@]}" 2>/dev/null || true
-for _d in "${_CACHE_DIRS[@]}"; do
-  setfacl -d -m g::rwx "${_d}" 2>/dev/null || true
-done
+mkdir -p "${VLLM_CACHE_DIR}" "${FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}" \
+  "${LUSTRE_INDUCTOR_CACHE}" "${LUSTRE_TRITON_CACHE}"
 
 VLLM_PRECOMPILED_WHEEL_LOCATION="${VLLM_PRECOMPILED_WHEEL_LOCATION:-https://github.com/vllm-project/vllm/releases/download/v0.17.0/vllm-0.17.0-cp38-abi3-manylinux_2_31_aarch64.whl}"
 
@@ -461,7 +449,6 @@ LOCAL_IND="${INDUCTOR_CACHE_DIR}"
 LOCAL_TRI="${TRITON_CACHE_DIR}"
 LUSTRE_IND="${LUSTRE_INDUCTOR_CACHE}"
 LUSTRE_TRI="${LUSTRE_TRITON_CACHE}"
-CACHE_ROOT="${PERSISTENT_CACHE}"
 if [ -d "\$LOCAL_IND" ] && [ "\$(ls -A "\$LOCAL_IND" 2>/dev/null)" ]; then
   rsync -a --ignore-errors "\$LOCAL_IND/" "\$LUSTRE_IND/" && echo "[CACHE SYNC] Inductor: synced to Lustre" \
     || echo "[CACHE SYNC] Inductor: sync failed (non-fatal)"
@@ -473,16 +460,6 @@ if [ -d "\$LOCAL_TRI" ] && [ "\$(ls -A "\$LOCAL_TRI" 2>/dev/null)" ]; then
     || echo "[CACHE SYNC] Triton: sync failed (non-fatal)"
 else
   echo "[CACHE SYNC] Triton: nothing to sync"
-fi
-# Fix group permissions on any dirs created at runtime (e.g. vllm_compile_cache_XXXX).
-# Only one node needs to do this; use a lock file so the rest skip it.
-_lock="\$CACHE_ROOT/.perm_fix_lock_\$\$"
-if ( set -o noclobber; echo "\$(hostname)" > "\$_lock" ) 2>/dev/null; then
-  echo "[CACHE SYNC] Fixing group permissions on cache tree..."
-  chmod -R g+rwX "\$CACHE_ROOT" 2>/dev/null || true
-  find "\$CACHE_ROOT" -type d ! -perm -g+s -exec chmod g+s {} + 2>/dev/null || true
-  rm -f "\$_lock"
-  echo "[CACHE SYNC] Permissions fixed."
 fi
 echo "[CACHE SYNC] Done."
 TEARDOWNEOF
