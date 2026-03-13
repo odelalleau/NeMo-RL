@@ -344,7 +344,7 @@ class ThreadSafeTimer(Timer):
 
     def __init__(self, context: Optional[dict[str, object]] = None) -> None:
         super().__init__(context=context)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def start(self, label: str) -> None:
         with self._lock:
