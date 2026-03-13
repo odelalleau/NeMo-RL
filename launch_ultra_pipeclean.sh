@@ -573,6 +573,7 @@ if [[ "${INTERACTIVE}" == "1" ]]; then
     --time="${WALLTIME}" \
     --gres=gpu:4 \
     --exclusive \
+    --mem=0 \
     ${SEGMENT_SIZE:+--segment="${SEGMENT_SIZE}"} \
     ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
     "${RAY_SUB}")
@@ -708,6 +709,7 @@ sbatch \
   --time="${WALLTIME}" \
   --gres=gpu:4 \
   --exclusive \
+  --mem=0 \
   --dependency=singleton \
   ${SEGMENT_SIZE:+--segment="${SEGMENT_SIZE}"} \
   ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
