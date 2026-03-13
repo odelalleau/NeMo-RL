@@ -618,7 +618,7 @@ CONTAINER_CWD=$(scontrol show job $SLURM_JOB_ID | grep -oP 'WorkDir=\K[^ ]+' | h
 if [[ -n "$COMMAND" ]]; then
   # Get container PID and execute command inside it
   head_container_pid=$(get_container_pid "$head_node")
-  srun --overlap --nodes=1 -w "$head_node" -o $LOG_DIR/ray-driver.log enroot exec "$head_container_pid" bash -c "cd $CONTAINER_CWD && $COMMAND"
+  srun --overlap --nodes=1 -w "$head_node" -o $LOG_DIR/ray-driver.log enroot exec "$head_container_pid" bash -c "export NRL_RAY_READY_EPOCH=$NRL_RAY_READY_EPOCH && cd $CONTAINER_CWD && $COMMAND"
 
   # Run teardown command on all nodes after COMMAND finishes (containers are still alive)
   if [[ -n "${TEARDOWN_COMMAND_FILE}" ]] && [[ -f "${TEARDOWN_COMMAND_FILE}" ]]; then
