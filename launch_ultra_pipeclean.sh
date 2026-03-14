@@ -480,7 +480,7 @@ if [[ ! -f "${RAY_SUB}" ]]; then
 fi
 
 # =================================================================================================================
-# Per-node cache seeding / sync-back
+# Per-node cache seeding
 # =================================================================================================================
 # Triton, Inductor, and FlashInfer cubins compile/download to node-local /tmp to avoid Lustre race conditions
 # and file lock contention during concurrent JIT compilation and cubin fetching.
@@ -519,35 +519,6 @@ echo "[CACHE SEED] Done."
 SETUPEOF
 export SETUP_COMMAND
 
-read -r -d '' TEARDOWN_COMMAND <<TEARDOWNEOF || true
-echo "[CACHE SYNC] Syncing Triton/Inductor/FlashInfer caches back to Lustre..."
-LOCAL_IND="${INDUCTOR_CACHE_DIR}"
-LOCAL_TRI="${TRITON_CACHE_DIR}"
-LOCAL_FI="${FLASHINFER_CUBIN_CACHE}"
-LUSTRE_IND="${LUSTRE_INDUCTOR_CACHE}"
-LUSTRE_TRI="${LUSTRE_TRITON_CACHE}"
-LUSTRE_FI="${LUSTRE_FLASHINFER_CUBIN_CACHE}"
-if [ -d "\$LOCAL_IND" ] && [ "\$(ls -A "\$LOCAL_IND" 2>/dev/null)" ]; then
-  rsync -a --ignore-errors "\$LOCAL_IND/" "\$LUSTRE_IND/" && echo "[CACHE SYNC] Inductor: synced to Lustre" \
-    || echo "[CACHE SYNC] Inductor: sync failed (non-fatal)"
-else
-  echo "[CACHE SYNC] Inductor: nothing to sync"
-fi
-if [ -d "\$LOCAL_TRI" ] && [ "\$(ls -A "\$LOCAL_TRI" 2>/dev/null)" ]; then
-  rsync -a --ignore-errors "\$LOCAL_TRI/" "\$LUSTRE_TRI/" && echo "[CACHE SYNC] Triton: synced to Lustre" \
-    || echo "[CACHE SYNC] Triton: sync failed (non-fatal)"
-else
-  echo "[CACHE SYNC] Triton: nothing to sync"
-fi
-if [ -d "\$LOCAL_FI" ] && [ "\$(ls -A "\$LOCAL_FI" 2>/dev/null)" ]; then
-  rsync -a --ignore-errors "\$LOCAL_FI/" "\$LUSTRE_FI/" && echo "[CACHE SYNC] FlashInfer cubins: synced to Lustre" \
-    || echo "[CACHE SYNC] FlashInfer cubins: sync failed (non-fatal)"
-else
-  echo "[CACHE SYNC] FlashInfer cubins: nothing to sync"
-fi
-echo "[CACHE SYNC] Done."
-TEARDOWNEOF
-export TEARDOWN_COMMAND
 
 # =============================================================================
 # Interactive mode

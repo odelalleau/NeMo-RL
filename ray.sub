@@ -57,7 +57,6 @@ CONTAINER=$CONTAINER
 MOUNTS=$MOUNTS
 COMMAND=${COMMAND:-}  # This is a script relative to the SLURM_SUBMIT_DIR. If left empty, it will leave the cluster idle after it's brought up.
 SETUP_COMMAND=${SETUP_COMMAND:-}  # Setup commands to run on all nodes before starting Ray
-TEARDOWN_COMMAND=${TEARDOWN_COMMAND:-}  # Teardown commands to run on all nodes after COMMAND finishes
 ########################################################
 # Ports for all nodes (should be odd numbers since we place head/worker[0] on the same node) so all workers get the odd ports, but the head will get +1 the ports
 NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-53001}
@@ -124,6 +123,10 @@ if [[ -n "${UV_CACHE_DIR_OVERRIDE:-}" ]]; then
 fi
 
 # Create logs directory
+# NOTE: LOG_DIR must be on a shared filesystem visible to both the submit host and all compute nodes.
+# File-based signaling between the submit host and containers 
+# (STARTED_RAY_HEAD, ray_worker_units, ENDED) relies on this. 
+# On systems without a shared FS, srun-based polling would be needed.
 BASE_LOG_DIR=${BASE_LOG_DIR:-$SLURM_SUBMIT_DIR}
 LOG_DIR="$BASE_LOG_DIR/$SLURM_JOB_ID-logs"
 mkdir -p $LOG_DIR
@@ -134,14 +137,6 @@ if [[ -n "$SETUP_COMMAND" ]]; then
   SETUP_COMMAND_FILE="$LOG_DIR/setup_command.sh"
   echo "$SETUP_COMMAND" > "$SETUP_COMMAND_FILE"
   chmod +x "$SETUP_COMMAND_FILE"
-fi
-
-# Write TEARDOWN_COMMAND to a file (mirrors SETUP_COMMAND pattern)
-TEARDOWN_COMMAND_FILE=""
-if [[ -n "$TEARDOWN_COMMAND" ]]; then
-  TEARDOWN_COMMAND_FILE="$LOG_DIR/teardown_command.sh"
-  echo "$TEARDOWN_COMMAND" > "$TEARDOWN_COMMAND_FILE"
-  chmod +x "$TEARDOWN_COMMAND_FILE"
 fi
 
 # Number of GPUs per worker node
@@ -313,13 +308,44 @@ fi
 RAY_RESOURCES+='}'
 TOPO_PROBE_EOF
 
-# First we start the head of the ray cluster on one of the physical nodes
-# Give the head node actual resources to make it schedulable
+# Submit-host variables that both head and worker scripts need.
+# Pyxis/Enroot containers do not inherit the submit host's environment, so these
+# are baked into a string and prepended to each script passed via bash -c.
+BAKED_ENV=$(cat <<ENVEOF
+export LOG_DIR="$LOG_DIR"
+export IP_HEAD="$ip_head"
+export HEAD_NODE_IP="$head_node_ip"
+export PORT=$PORT
+export RAY_CLIENT_SERVER_PORT=$RAY_CLIENT_SERVER_PORT
+export DASHBOARD_PORT=$DASHBOARD_PORT
+export DASHBOARD_AGENT_LISTEN_PORT=$DASHBOARD_AGENT_LISTEN_PORT
+export NODE_MANAGER_PORT=$NODE_MANAGER_PORT
+export OBJECT_MANAGER_PORT=$OBJECT_MANAGER_PORT
+export RUNTIME_ENV_AGENT_PORT=$RUNTIME_ENV_AGENT_PORT
+export DASHBOARD_AGENT_GRPC_PORT=$DASHBOARD_AGENT_GRPC_PORT
+export METRICS_EXPORT_PORT=$METRICS_EXPORT_PORT
+export MIN_WORKER_PORT=$MIN_WORKER_PORT
+export MAX_WORKER_PORT=$MAX_WORKER_PORT
+export RAY_DEBUGGER_ARGS="$RAY_DEBUGGER_ARGS"
+export RAY_LOG_SYNC_FREQUENCY="$RAY_LOG_SYNC_FREQUENCY"
+export SETUP_COMMAND_FILE="$SETUP_COMMAND_FILE"
+export GPUS_PER_NODE=$GPUS_PER_NODE
+export HEAD_NUM_RETRIES=$num_retries
+export WORKER_NUM_RETRIES=20
+ENVEOF
+)
 
-head_cmd=$(cat <<EOF
-# Touch a file to indicate that the head node has started
-# Overlapping srun commands will check this file to determine if we can overlap a container command
-touch $LOG_DIR/STARTED_RAY_HEAD
+# First we start the head of the ray cluster on one of the physical nodes.
+# Give the head node actual resources to make it schedulable.
+# Pyxis/Enroot containers do not inherit the submit host's environment,
+# so BAKED_ENV is prepended to give the script the variables it needs.
+HEAD_BODY=$(cat <<'HEAD_BODY_EOF'
+set -oux pipefail
+
+# Touch a file to indicate that the head node container has started.
+# The submit host and worker containers poll for this file on the shared filesystem
+# to know that the head is alive (not that Ray is ready — that comes later).
+touch "$LOG_DIR/STARTED_RAY_HEAD"
 env
 
 exit-dramatically() {
@@ -351,18 +377,18 @@ log-sync-sidecar() {
     echo "RAY_LOG_SYNC_FREQUENCY is not set, skipping log sync sidecar"
     return
   fi
-  mkdir -p $LOG_DIR/ray
+  mkdir -p "$LOG_DIR/ray"
   while true; do
-    sleep $RAY_LOG_SYNC_FREQUENCY
+    sleep "$RAY_LOG_SYNC_FREQUENCY"
     if ls /tmp/ray/session_[0-9]* > /dev/null 2>&1; then
       for session_dir in /tmp/ray/session_[0-9]*/; do
-        if [[ -d "\$session_dir/logs" ]]; then
-          session_name=\$(basename "\$session_dir")
-          mkdir -p "$LOG_DIR/ray/\$session_name"
+        if [[ -d "$session_dir/logs" ]]; then
+          session_name=$(basename "$session_dir")
+          mkdir -p "$LOG_DIR/ray/$session_name"
           if command -v rsync > /dev/null 2>&1; then
-            rsync -ahP "\$session_dir/logs/" "$LOG_DIR/ray/\$session_name/logs/" 2>/dev/null || true
+            rsync -ahP "$session_dir/logs/" "$LOG_DIR/ray/$session_name/logs/" 2>/dev/null || true
           else
-            cp -r "\$session_dir/logs" "$LOG_DIR/ray/\$session_name/"
+            cp -r "$session_dir/logs" "$LOG_DIR/ray/$session_name/"
           fi
         fi
       done
@@ -375,20 +401,43 @@ log-sync-sidecar() {
 }
 log-sync-sidecar &
 
+# Background process to periodically write the current worker_units count to a file
+# on the shared filesystem. The submit host reads this file instead of issuing srun RPCs.
+# Uses atomic write-to-tmp + mv to avoid partial reads.
+ray-status-sidecar() {
+  set +x
+  while true; do
+    sleep 10
+    units=$(ray status 2>/dev/null | grep "worker_units" | awk -F'[/. ]' '{print $4}' || echo 0)
+    echo "$units" > "$LOG_DIR/.ray_worker_units.tmp"
+    mv "$LOG_DIR/.ray_worker_units.tmp" "$LOG_DIR/ray_worker_units"
+    if [[ -f "$LOG_DIR/ENDED" ]]; then break; fi
+  done
+}
+ray-status-sidecar &
+
 # Patch nsight.py before starting Ray head
 sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
 
-source $LOG_DIR/topology_probe.sh
+source "$LOG_DIR/topology_probe.sh"
 
-cat <<EOFINNER | tee /launch-head.sh
+count=0
+while [[ $count -lt $HEAD_NUM_RETRIES ]]; do
+  if [[ -n "$SETUP_COMMAND_FILE" ]] && [[ -f "$SETUP_COMMAND_FILE" ]]; then
+    echo "[INFO] Running setup command from $SETUP_COMMAND_FILE..."
+    bash "$SETUP_COMMAND_FILE"
+  fi
+  # Two-level evaluation: heredoc expands $RAY_RESOURCES (with \") into text,
+  # then bash re-parses it so \" inside double quotes becomes clean ".
+  cat <<EOFINNER | bash
 ray start --head \
     --disable-usage-stats \
-    --resources="\$RAY_RESOURCES" \
-    --node-ip-address="$head_node_ip" \
+    --resources="$RAY_RESOURCES" \
+    --node-ip-address="$HEAD_NODE_IP" \
     --port=${PORT} \
     --ray-client-server-port=${RAY_CLIENT_SERVER_PORT} \
     --dashboard-port=${DASHBOARD_PORT} \
-    --dashboard-host="$head_node_ip" \
+    --dashboard-host="$HEAD_NODE_IP" \
     --include-dashboard=True \
     \
     --node-manager-port=$((${NODE_MANAGER_PORT} + 1)) \
@@ -399,39 +448,25 @@ ray start --head \
     --metrics-export-port=$((${METRICS_EXPORT_PORT} + 1)) \
     $RAY_DEBUGGER_ARGS \
     \
-    --block 
+    --block
 EOFINNER
-chmod +x /launch-head.sh
-
-count=0
-while [[ \$count -lt $num_retries ]]; do
-  if [[ -n "$SETUP_COMMAND_FILE" ]] && [[ -f "$SETUP_COMMAND_FILE" ]]; then
-    echo "[INFO] Running setup command from $SETUP_COMMAND_FILE..."
-    bash "$SETUP_COMMAND_FILE"
-  fi
-  bash /launch-head.sh
-  count=\$((count+1))
-  echo "Head node failed \$count/$num_retries times, restarting in 5 seconds..."
+  count=$((count+1))
+  echo "Head node failed $count/$HEAD_NUM_RETRIES times, restarting in 5 seconds..."
   sleep 5
 done
-touch $LOG_DIR/ENDED
+touch "$LOG_DIR/ENDED"
 exit 1
-EOF
+HEAD_BODY_EOF
 )
-srun $COMMON_SRUN_ARGS --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
-SRUN_PIDS["ray-head"]=$!
-
-sleep 120s
-NUM_ACTORS=$((GPUS_PER_NODE * SLURM_JOB_NUM_NODES))
 
 # Start Ray worker nodes
 # We want 1 Ray worker node per physical node (excluding the head node)
 # Worker nodes are started with ray start but without the --head flag
-# Start from node 1 since node 0 is running the head
-for ((i = 1; i < SLURM_JOB_NUM_NODES; i++)); do
-  node_i=${nodes_array[$i]}
-    
-  worker_cmd=$(cat <<EOF
+# srun -o with %t produces 0-indexed ray-worker-{0..N-2}.log files.
+WORKER_BODY=$(cat <<'WORKER_BODY_EOF'
+set -oux pipefail
+
+echo "[INFO] Worker $SLURM_PROCID on node $SLURMD_NODENAME (SLURM_PROCID=$SLURM_PROCID)"
 env
 
 exit-dramatically() {
@@ -462,18 +497,18 @@ log-sync-sidecar() {
     echo "RAY_LOG_SYNC_FREQUENCY is not set, skipping log sync sidecar"
     return
   fi
-  mkdir -p $LOG_DIR/ray/$node_i
+  mkdir -p "$LOG_DIR/ray/$SLURMD_NODENAME"
   while true; do
-    sleep $RAY_LOG_SYNC_FREQUENCY
+    sleep "$RAY_LOG_SYNC_FREQUENCY"
     if ls /tmp/ray/session_[0-9]* > /dev/null 2>&1; then
       for session_dir in /tmp/ray/session_[0-9]*/; do
-        if [[ -d "\$session_dir/logs" ]]; then
-          session_name=\$(basename "\$session_dir")
-          mkdir -p "$LOG_DIR/ray/$node_i/\$session_name"
+        if [[ -d "$session_dir/logs" ]]; then
+          session_name=$(basename "$session_dir")
+          mkdir -p "$LOG_DIR/ray/$SLURMD_NODENAME/$session_name"
           if command -v rsync > /dev/null 2>&1; then
-            rsync -ahP "\$session_dir/logs/" $LOG_DIR/ray/$node_i/\$session_name/logs/ 2>/dev/null || true
+            rsync -ahP "$session_dir/logs/" "$LOG_DIR/ray/$SLURMD_NODENAME/$session_name/logs/" 2>/dev/null || true
           else
-            cp -r "\$session_dir/logs" $LOG_DIR/ray/$node_i/\$session_name/
+            cp -r "$session_dir/logs" "$LOG_DIR/ray/$SLURMD_NODENAME/$session_name/"
           fi
         fi
       done
@@ -489,12 +524,33 @@ log-sync-sidecar &
 # Patch nsight.py before starting Ray worker
 sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
 
-source $LOG_DIR/topology_probe.sh
+source "$LOG_DIR/topology_probe.sh"
 
-cat <<EOFINNER | tee /launch-worker.sh
-ray start --address "$ip_head" \
+echo "[INFO] Worker $SLURM_PROCID: waiting for Ray head container..."
+while true; do
+  if [[ -f "$LOG_DIR/STARTED_RAY_HEAD" ]]; then
+    echo "[INFO] Worker $SLURM_PROCID: Ray head container detected."
+    break
+  fi
+  if [[ -f "$LOG_DIR/ENDED" ]]; then
+    echo "[ERROR] ENDED detected before head started, exiting."
+    exit 1
+  fi
+  sleep 5
+done
+
+count=0
+while [[ $count -lt $WORKER_NUM_RETRIES ]]; do
+  if [[ -n "$SETUP_COMMAND_FILE" ]] && [[ -f "$SETUP_COMMAND_FILE" ]]; then
+    echo "[INFO] Running setup command from $SETUP_COMMAND_FILE..."
+    bash "$SETUP_COMMAND_FILE"
+  fi
+  # Two-level evaluation: heredoc expands $RAY_RESOURCES (with \") into text,
+  # then bash re-parses it so \" inside double quotes becomes clean ".
+  cat <<EOFINNER | bash
+ray start --address "$IP_HEAD" \
           --disable-usage-stats \
-          --resources="\$RAY_RESOURCES" \
+          --resources="$RAY_RESOURCES" \
           --min-worker-port=${MIN_WORKER_PORT} \
           --max-worker-port=${MAX_WORKER_PORT} \
           \
@@ -506,31 +562,50 @@ ray start --address "$ip_head" \
           --metrics-export-port=${METRICS_EXPORT_PORT} \
           $RAY_DEBUGGER_ARGS \
           \
-          --block 
+          --block
 EOFINNER
-
-count=0
-while [[ \$count -lt $num_retries ]]; do
-  if [[ -n "$SETUP_COMMAND_FILE" ]] && [[ -f "$SETUP_COMMAND_FILE" ]]; then
-    echo "[INFO] Running setup command from $SETUP_COMMAND_FILE..."
-    bash "$SETUP_COMMAND_FILE"
-  fi
-  bash /launch-worker.sh
-  count=\$((count+1))
-  echo "Worker failed \$count/$num_retries times, restarting in 5 seconds..."
-  sleep 5
+  count=$((count+1))
+  echo "Worker $SLURM_PROCID failed $count/$WORKER_NUM_RETRIES times, restarting in 10 seconds..."
+  sleep 10
 done
-touch $LOG_DIR/ENDED
+touch "$LOG_DIR/ENDED"
 exit 1
-EOF
+WORKER_BODY_EOF
 )
-  srun $COMMON_SRUN_ARGS --exact --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$node_i" -o $LOG_DIR/ray-worker-$i.log bash -x -c "$worker_cmd" &
-  SRUN_PIDS["ray-worker-$i"]=$!
-  sleep 3
-done
 
-# Then we wait here for the file to be created by the head node container
-while check_srun_processes && ! srun --overlap --nodes=1 --ntasks=1 -w $head_node test -f $LOG_DIR/STARTED_RAY_HEAD; do
+# Join BAKED_ENV + body into complete scripts passed to srun via bash -c.
+# The single-quoted heredoc bodies contain unexpanded $vars that resolve at
+# container runtime; BAKED_ENV provides the submit-host values they need.
+HEAD_SCRIPT=$(printf '%s\n%s' "$BAKED_ENV" "$HEAD_BODY")
+WORKER_SCRIPT=$(printf '%s\n%s' "$BAKED_ENV" "$WORKER_BODY")
+
+[[ -z "$HEAD_SCRIPT" ]] && echo "[FATAL] HEAD_SCRIPT is empty" >&2 && exit 1
+[[ -z "$WORKER_SCRIPT" ]] && echo "[FATAL] WORKER_SCRIPT is empty" >&2 && exit 1
+
+bash -n <(printf '%s' "$HEAD_SCRIPT") || { echo "[FATAL] Head script has syntax errors" >&2; exit 1; }
+bash -n <(printf '%s' "$WORKER_SCRIPT") || { echo "[FATAL] Worker script has syntax errors" >&2; exit 1; }
+
+# Start head node
+srun $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$HEAD_SCRIPT" &
+SRUN_PIDS["ray-head"]=$!
+
+NUM_ACTORS=$((GPUS_PER_NODE * SLURM_JOB_NUM_NODES))
+
+# Start all worker nodes with a single multi-node srun.
+# srun -o with %t produces per-task log files: ray-worker-0.log, ray-worker-1.log, etc.
+srun $COMMON_SRUN_ARGS --container-name=ray-worker --exact \
+  --nodes=$((SLURM_JOB_NUM_NODES - 1)) \
+  --ntasks=$((SLURM_JOB_NUM_NODES - 1)) \
+  --ntasks-per-node=1 \
+  --cpus-per-task=$CPUS_PER_WORKER \
+  --kill-on-bad-exit=0 \
+  --exclude="$head_node" \
+  -o "$LOG_DIR/ray-worker-%t.log" \
+  bash -c "$WORKER_SCRIPT" &
+SRUN_PIDS["ray-workers"]=$!
+
+# Wait for the head container to signal it has started
+while check_srun_processes && ! test -f "$LOG_DIR/STARTED_RAY_HEAD"; do
   echo "[INFO][$(date)] Waiting for head node container to start..."
   sleep 2
 done
@@ -570,44 +645,21 @@ fi
 # Before we launch a job on this cluster we need to make sure that the bringup is complete
 # We do so by querying the number of worker_units in the ray cluster and asserting = NUM_ACTORS
 
-# Helper function to get container PID using enroot
-# Since we use -w to target specific nodes and only run one container per node,
-# we can just grab the first (and only) container PID on that node
-get_container_pid() {
-  local node=$1
-  srun --overlap --nodes=1 -w "$node" bash -c "enroot list -f | awk 'NR>1 && \$2 ~ /^[0-9]+\$/ {print \$2; exit}'"
-}
-
-extract_worker_units() {
-  # Get the container PID for ray-head
-  head_container_pid=$(get_container_pid "$head_node")
-  if [[ -z "$head_container_pid" ]]; then
-    echo 0
-    return
-  fi
-  
-  # Execute ray status inside the container using enroot exec
-  status_output=$(srun --overlap --nodes=1 -w "$head_node" enroot exec "$head_container_pid" ray status)
-  if echo "$status_output" | grep -q "worker_units"; then
-    worker_units=$(echo "$status_output" | grep "worker_units" | awk -F'[/. ]' '{print $4}')
-    echo $worker_units
-  else
-    echo 0
-  fi
-}
-
-# Poll to make sure that all Ray worker nodes have connected to the head.
-# All workers have connected when number of GPUs in ray cluster
-# is equal to NUM_ACTORS. We use the utility function above
-# to check how many GPUs have come online in the ray cluster
+# Poll for all Ray workers to connect by reading the file written by ray-status-sidecar in the head container
+RAY_STATUS_DEADLINE=$((SECONDS + 1800))
 while true; do
-  worker_units=$(extract_worker_units)
+  worker_units=$(cat "$LOG_DIR/ray_worker_units" 2>/dev/null || echo -1)
   echo "[INFO] Number of actors online: $worker_units/$NUM_ACTORS"
   if [[ "$worker_units" -eq "$NUM_ACTORS" ]]; then
     break
   fi
   check_srun_processes
-  sleep 2
+  if (( SECONDS > RAY_STATUS_DEADLINE )); then
+    echo "[ERROR] Timed out waiting for all workers to connect ($worker_units/$NUM_ACTORS after 30 min)"
+    touch "$LOG_DIR/ENDED"
+    exit 1
+  fi
+  sleep 5
 done
 
 echo "All workers connected!"
@@ -618,58 +670,34 @@ export NRL_RAY_READY_EPOCH=$(date +%s.%N)
 # This driver process is responsible for launching a job on the Ray cluster
 CONTAINER_CWD=$(scontrol show job $SLURM_JOB_ID | grep -oP 'WorkDir=\K[^ ]+' | head -1)
 if [[ -n "$COMMAND" ]]; then
-  # Get container PID and execute command inside it
-  head_container_pid=$(get_container_pid "$head_node")
-  srun --overlap --nodes=1 -w "$head_node" -o $LOG_DIR/ray-driver.log enroot exec "$head_container_pid" bash -c "export NRL_RAY_READY_EPOCH=$NRL_RAY_READY_EPOCH && cd $CONTAINER_CWD && $COMMAND"
-
-  # Run teardown command on all nodes after COMMAND finishes (containers are still alive)
-  if [[ -n "${TEARDOWN_COMMAND_FILE}" ]] && [[ -f "${TEARDOWN_COMMAND_FILE}" ]]; then
-    echo "[INFO] Running teardown command on all ${#nodes_array[@]} nodes..."
-    for node in "${nodes_array[@]}"; do
-      container_pid=$(get_container_pid "$node")
-      srun --overlap --nodes=1 -w "$node" -o $LOG_DIR/teardown-${node}.log \
-        enroot exec "$container_pid" \
-        bash "$TEARDOWN_COMMAND_FILE" &
-    done
-    wait
-    echo "[INFO] Teardown complete on all nodes."
-  fi
+  srun --no-container-mount-home --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" -o $LOG_DIR/ray-driver.log bash -c "export NRL_RAY_READY_EPOCH=$NRL_RAY_READY_EPOCH && $COMMAND"
 else
   echo "[INFO]: Ray Cluster is idled, run this on the slurm head node to get a shell to the head node:"
   cat <<EOF >$SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh
 # No args launches on the head node (node 0)
 # Args 1-N launch on worker nodes (nodes 1 through N-1)
 # Optional: set COMMAND='...' to run non-interactively instead of opening an interactive shell
-
-# Helper to get container PID
-get_container_pid() {
-  local node=\$1
-  srun --overlap --nodes=1 -w "\$node" --jobid $SLURM_JOB_ID bash -c "enroot list -f | awk 'NR>1 && \\\$2 ~ /^[0-9]+\\\$/ {print \\\$2; exit}'"
-}
-
 WORKER_NUM=\${1:-}
 if [[ -z "\$WORKER_NUM" ]]; then
   # Empty means we are on the head node
-  HEAD_PID=\$(get_container_pid "$head_node")
   if [[ -n "\${COMMAND:-}" ]]; then
-    srun $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --nodes=1 -w "$head_node" --jobid $SLURM_JOB_ID enroot exec "\$HEAD_PID" bash -c "cd $CONTAINER_CWD && \$COMMAND"
+    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID bash -c "\$COMMAND"
   else
-    srun $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --nodes=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty enroot exec "\$HEAD_PID" bash -c "cd $CONTAINER_CWD && exec bash"
+    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty bash
   fi
 else
-  # Worker numbers 1 through N-1 correspond to ray-worker-1 through ray-worker-(N-1)
-  # and use nodes_array[1] through nodes_array[N-1]
+  # Worker numbers 1 through N-1 map to nodes_array[1] through nodes_array[N-1]
+  # Log files are 0-indexed: worker K has ray-worker-$((K-1)).log
   if [[ \$WORKER_NUM -lt 1 || \$WORKER_NUM -ge $SLURM_JOB_NUM_NODES ]]; then
     echo "Error: WORKER_NUM must be between 1 and $((SLURM_JOB_NUM_NODES-1))"
     exit 1
   fi
-  nodes_array=(${nodes_array[*]})
+  nodes_array=($nodes)
   node="\${nodes_array[\$WORKER_NUM]}"
-  WORKER_PID=\$(get_container_pid "\$node")
   if [[ -n "\${COMMAND:-}" ]]; then
-    srun $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --nodes=1 -w "\$node" --jobid $SLURM_JOB_ID enroot exec "\$WORKER_PID" bash -c "cd $CONTAINER_CWD && \$COMMAND"
+    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\$node" --jobid $SLURM_JOB_ID bash -c "\$COMMAND"
   else
-    srun $GRES_ARG -A SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --nodes=1 -w "\$node" --jobid $SLURM_JOB_ID --pty enroot exec "\$WORKER_PID" bash -c "cd $CONTAINER_CWD && exec bash"
+    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\$node" --jobid $SLURM_JOB_ID --pty bash
   fi
 fi
 EOF
