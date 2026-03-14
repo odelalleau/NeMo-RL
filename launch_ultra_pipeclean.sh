@@ -232,14 +232,15 @@ if [[ -z "${PERSISTENT_CACHE:-}" ]]; then
   PERSISTENT_CACHE="/lustre/fsw/portfolios/${_access_group}/users/${USER}/.cache/nemotron_ultra"
 fi
 VLLM_CACHE_DIR="${PERSISTENT_CACHE}/vllm_compile_cache"
-FLASHINFER_CUBIN_CACHE="${PERSISTENT_CACHE}/flashinfer_cubins"
+LUSTRE_FLASHINFER_CUBIN_CACHE="${PERSISTENT_CACHE}/flashinfer_cubins"
+FLASHINFER_CUBIN_CACHE="/tmp/nemo_rl_flashinfer_cubins"
 FLASHINFER_WS_BASE="${PERSISTENT_CACHE}/flashinfer_workspace"
 LUSTRE_INDUCTOR_CACHE="${PERSISTENT_CACHE}/inductor_cache"
 LUSTRE_TRITON_CACHE="${PERSISTENT_CACHE}/triton_cache"
 INDUCTOR_CACHE_DIR="/tmp/nemo_rl_inductor_cache"
 TRITON_CACHE_DIR="/tmp/nemo_rl_triton_cache"
 
-mkdir -p "${VLLM_CACHE_DIR}" "${FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}" \
+mkdir -p "${VLLM_CACHE_DIR}" "${LUSTRE_FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}" \
   "${LUSTRE_INDUCTOR_CACHE}" "${LUSTRE_TRITON_CACHE}"
 
 VLLM_PRECOMPILED_WHEEL_LOCATION="${VLLM_PRECOMPILED_WHEEL_LOCATION:-https://github.com/vllm-project/vllm/releases/download/v0.17.0/vllm-0.17.0-cp38-abi3-manylinux_2_31_aarch64.whl}"
@@ -481,18 +482,21 @@ fi
 # =================================================================================================================
 # Per-node cache seeding / sync-back
 # =================================================================================================================
-# Triton and Inductor compile to node-local /tmp to avoid Lustre race conditions during concurrent JIT compilation.
+# Triton, Inductor, and FlashInfer cubins compile/download to node-local /tmp to avoid Lustre race conditions
+# and file lock contention during concurrent JIT compilation and cubin fetching.
 # To avoid cold-start penalties, we seed /tmp from a warm Lustre cache before Ray starts (SETUP_COMMAND)
 # and sync new artifacts back afterwards (TEARDOWN_COMMAND).
 # Both commands run on every node via ray.sub.
 # =================================================================================================================
 read -r -d '' SETUP_COMMAND <<SETUPEOF || true
-echo "[CACHE SEED] Seeding Triton/Inductor caches from Lustre..."
+echo "[CACHE SEED] Seeding Triton/Inductor/FlashInfer caches from Lustre..."
 LOCAL_IND="${INDUCTOR_CACHE_DIR}"
 LOCAL_TRI="${TRITON_CACHE_DIR}"
+LOCAL_FI="${FLASHINFER_CUBIN_CACHE}"
 LUSTRE_IND="${LUSTRE_INDUCTOR_CACHE}"
 LUSTRE_TRI="${LUSTRE_TRITON_CACHE}"
-mkdir -p "\$LOCAL_IND" "\$LOCAL_TRI"
+LUSTRE_FI="${LUSTRE_FLASHINFER_CUBIN_CACHE}"
+mkdir -p "\$LOCAL_IND" "\$LOCAL_TRI" "\$LOCAL_FI"
 if [ -d "\$LUSTRE_IND" ] && [ "\$(ls -A "\$LUSTRE_IND" 2>/dev/null)" ]; then
   cp -a "\$LUSTRE_IND/." "\$LOCAL_IND/" && echo "[CACHE SEED] Inductor: seeded from Lustre" \
     || echo "[CACHE SEED] Inductor: seed failed (non-fatal)"
@@ -505,16 +509,24 @@ if [ -d "\$LUSTRE_TRI" ] && [ "\$(ls -A "\$LUSTRE_TRI" 2>/dev/null)" ]; then
 else
   echo "[CACHE SEED] Triton: no warm cache on Lustre yet"
 fi
+if [ -d "\$LUSTRE_FI" ] && [ "\$(ls -A "\$LUSTRE_FI" 2>/dev/null)" ]; then
+  cp -a "\$LUSTRE_FI/." "\$LOCAL_FI/" && echo "[CACHE SEED] FlashInfer cubins: seeded from Lustre" \
+    || echo "[CACHE SEED] FlashInfer cubins: seed failed (non-fatal)"
+else
+  echo "[CACHE SEED] FlashInfer cubins: no warm cache on Lustre yet"
+fi
 echo "[CACHE SEED] Done."
 SETUPEOF
 export SETUP_COMMAND
 
 read -r -d '' TEARDOWN_COMMAND <<TEARDOWNEOF || true
-echo "[CACHE SYNC] Syncing Triton/Inductor caches back to Lustre..."
+echo "[CACHE SYNC] Syncing Triton/Inductor/FlashInfer caches back to Lustre..."
 LOCAL_IND="${INDUCTOR_CACHE_DIR}"
 LOCAL_TRI="${TRITON_CACHE_DIR}"
+LOCAL_FI="${FLASHINFER_CUBIN_CACHE}"
 LUSTRE_IND="${LUSTRE_INDUCTOR_CACHE}"
 LUSTRE_TRI="${LUSTRE_TRITON_CACHE}"
+LUSTRE_FI="${LUSTRE_FLASHINFER_CUBIN_CACHE}"
 if [ -d "\$LOCAL_IND" ] && [ "\$(ls -A "\$LOCAL_IND" 2>/dev/null)" ]; then
   rsync -a --ignore-errors "\$LOCAL_IND/" "\$LUSTRE_IND/" && echo "[CACHE SYNC] Inductor: synced to Lustre" \
     || echo "[CACHE SYNC] Inductor: sync failed (non-fatal)"
@@ -526,6 +538,12 @@ if [ -d "\$LOCAL_TRI" ] && [ "\$(ls -A "\$LOCAL_TRI" 2>/dev/null)" ]; then
     || echo "[CACHE SYNC] Triton: sync failed (non-fatal)"
 else
   echo "[CACHE SYNC] Triton: nothing to sync"
+fi
+if [ -d "\$LOCAL_FI" ] && [ "\$(ls -A "\$LOCAL_FI" 2>/dev/null)" ]; then
+  rsync -a --ignore-errors "\$LOCAL_FI/" "\$LUSTRE_FI/" && echo "[CACHE SYNC] FlashInfer cubins: synced to Lustre" \
+    || echo "[CACHE SYNC] FlashInfer cubins: sync failed (non-fatal)"
+else
+  echo "[CACHE SYNC] FlashInfer cubins: nothing to sync"
 fi
 echo "[CACHE SYNC] Done."
 TEARDOWNEOF
