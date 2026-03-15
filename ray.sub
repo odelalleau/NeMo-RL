@@ -440,12 +440,6 @@ sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/conte
 
 source "$LOG_DIR/topology_probe.sh"
 
-# Clean up any stale Ray state from a previous job that ran on this node.
-# Without this, ray start --head fails with an AssertionError when the
-# persisted session name in /tmp/ray doesn't match the new session.
-ray stop || true
-rm -rf /tmp/ray/session_* || true
-
 # Start Ray head without --block
 # Without --block, ray start --head starts the daemon and returns 0 once the
 # GCS is listening. This lets us touch STARTED_RAY_HEAD after the head is
@@ -453,6 +447,13 @@ rm -rf /tmp/ray/session_* || true
 # against a port that isn't listening yet.
 count=0
 while [[ $count -lt $HEAD_NUM_RETRIES ]]; do
+  # Clean up stale Ray state before every attempt.  If a previous attempt
+  # timed out, it leaves a session directory behind.  Without cleaning it,
+  # the next `ray start --head` hits:
+  #   AssertionError: Session name ... does not match persisted value ...
+  ray stop || true
+  rm -rf /tmp/ray/session_* || true
+
   if [[ -n "$SETUP_COMMAND_FILE" ]] && [[ -f "$SETUP_COMMAND_FILE" ]]; then
     echo "[INFO] Running setup command from $SETUP_COMMAND_FILE..."
     bash "$SETUP_COMMAND_FILE"
@@ -478,10 +479,11 @@ ray start --head \
     --metrics-export-port=$((${METRICS_EXPORT_PORT} + 1)) \
     $RAY_DEBUGGER_ARGS
 EOFINNER
+    echo "[INFO] Ray head started successfully (attempt $((count+1))/$HEAD_NUM_RETRIES)"
     break
   fi
   count=$((count+1))
-  echo "Head node failed $count/$HEAD_NUM_RETRIES times, restarting in 5 seconds..."
+  echo "[WARN] Head node failed $count/$HEAD_NUM_RETRIES times, restarting in 5 seconds..."
   sleep 5
 done
 if [[ $count -ge $HEAD_NUM_RETRIES ]]; then
@@ -631,12 +633,18 @@ done
 
 count=0
 while [[ $count -lt $WORKER_NUM_RETRIES ]]; do
+  # Clean up stale Ray state before every attempt so a half-started
+  # raylet from a previous attempt doesn't block the next one.
+  ray stop || true
+  rm -rf /tmp/ray/session_* || true
+
   if [[ -n "$SETUP_COMMAND_FILE" ]] && [[ -f "$SETUP_COMMAND_FILE" ]]; then
     echo "[INFO] Running setup command from $SETUP_COMMAND_FILE..."
     bash "$SETUP_COMMAND_FILE"
   fi
   # Two-level evaluation: heredoc expands $RAY_RESOURCES (with \") into text,
   # then bash re-parses it so \" inside double quotes becomes clean ".
+  echo "[INFO] Worker $SLURM_PROCID: starting Ray worker (attempt $((count+1))/$WORKER_NUM_RETRIES)..."
   cat <<EOFINNER | bash
 ray start --address "$IP_HEAD" \
           --disable-usage-stats \
@@ -655,7 +663,7 @@ ray start --address "$IP_HEAD" \
           --block
 EOFINNER
   count=$((count+1))
-  echo "Worker $SLURM_PROCID failed $count/$WORKER_NUM_RETRIES times, restarting in 10 seconds..."
+  echo "[WARN] Worker $SLURM_PROCID failed $count/$WORKER_NUM_RETRIES times, restarting in 10 seconds..."
   sleep 10
 done
 touch "$LOG_DIR/ENDED"
