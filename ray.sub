@@ -734,15 +734,18 @@ srun $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per
 SRUN_PIDS["ray-head"]=$!
 
 # Start all worker nodes with a single multi-node srun.
-# srun -o with %t produces per-task log files: ray-worker-0.log, ray-worker-1.log, etc.
+# srun -o with %t produces per-task log files
+# Zero-pad to the width of the worker count so filenames sort naturally
+_num_workers=$((SLURM_JOB_NUM_NODES - 1))
+_task_digits=${#_num_workers}
 srun $COMMON_SRUN_ARGS --container-name=ray-worker --exact \
-  --nodes=$((SLURM_JOB_NUM_NODES - 1)) \
-  --ntasks=$((SLURM_JOB_NUM_NODES - 1)) \
+  --nodes=$_num_workers \
+  --ntasks=$_num_workers \
   --ntasks-per-node=1 \
   --cpus-per-task=$CPUS_PER_WORKER \
   --kill-on-bad-exit=0 \
   --exclude="$head_node" \
-  -o "$LOG_DIR/ray-worker-%t.log" \
+  -o "$LOG_DIR/ray-worker-%0${_task_digits}t.log" \
   bash -xc "$WORKER_SCRIPT" &
 SRUN_PIDS["ray-workers"]=$!
 
