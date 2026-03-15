@@ -139,8 +139,18 @@ if [[ -n "$SETUP_COMMAND" ]]; then
   chmod +x "$SETUP_COMMAND_FILE"
 fi
 
+# Write COMMAND to a file to safely pass it into the container without quoting issues.
+# The head container checks for this file to decide non-interactive vs interactive mode.
+DRIVER_COMMAND_FILE=""
+if [[ -n "$COMMAND" ]]; then
+  DRIVER_COMMAND_FILE="$LOG_DIR/driver_command.sh"
+  printf '%s' "$COMMAND" > "$DRIVER_COMMAND_FILE"
+  chmod +x "$DRIVER_COMMAND_FILE"
+fi
+
 # Number of GPUs per worker node
 GPUS_PER_NODE=${GPUS_PER_NODE:-4}
+NUM_ACTORS=$((GPUS_PER_NODE * SLURM_JOB_NUM_NODES))
 
 # Detect GRES support and set GRES_ARG
 GRES_ARG=$(maybe_gres_arg)
@@ -308,6 +318,14 @@ fi
 RAY_RESOURCES+='}'
 TOPO_PROBE_EOF
 
+# Set up sandbox ports directory on shared FS (if sandbox is configured).
+# Must be set before BAKED_ENV so it can be passed to containers.
+SANDBOX_PORTS_DIR=""
+if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
+  SANDBOX_PORTS_DIR="$LOG_DIR/sandbox"
+  mkdir -p "$SANDBOX_PORTS_DIR"
+fi
+
 # Submit-host variables that both head and worker scripts need.
 # Pyxis/Enroot containers do not inherit the submit host's environment, so these
 # are baked into a string and prepended to each script passed via bash -c.
@@ -332,6 +350,11 @@ export SETUP_COMMAND_FILE="$SETUP_COMMAND_FILE"
 export GPUS_PER_NODE=$GPUS_PER_NODE
 export HEAD_NUM_RETRIES=$num_retries
 export WORKER_NUM_RETRIES=20
+export DRIVER_COMMAND_FILE="$DRIVER_COMMAND_FILE"
+export NUM_ACTORS=$NUM_ACTORS
+export NRL_JOB_START_EPOCH=$NRL_JOB_START_EPOCH
+export SANDBOX_PORTS_DIR="$SANDBOX_PORTS_DIR"
+export TOTAL_NUM_NODES=$SLURM_JOB_NUM_NODES
 ENVEOF
 )
 
@@ -342,10 +365,6 @@ ENVEOF
 HEAD_BODY=$(cat <<'HEAD_BODY_EOF'
 set -oux pipefail
 
-# Touch a file to indicate that the head node container has started.
-# The submit host and worker containers poll for this file on the shared filesystem
-# to know that the head is alive (not that Ray is ready — that comes later).
-touch "$LOG_DIR/STARTED_RAY_HEAD"
 env
 
 exit-dramatically() {
@@ -421,6 +440,17 @@ sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/conte
 
 source "$LOG_DIR/topology_probe.sh"
 
+# Clean up any stale Ray state from a previous job that ran on this node.
+# Without this, ray start --head fails with an AssertionError when the
+# persisted session name in /tmp/ray doesn't match the new session.
+ray stop || true
+rm -rf /tmp/ray/session_* || true
+
+# Start Ray head without --block
+# Without --block, ray start --head starts the daemon and returns 0 once the
+# GCS is listening. This lets us touch STARTED_RAY_HEAD after the head is
+# actually ready, so workers connect on the first try instead of retrying
+# against a port that isn't listening yet.
 count=0
 while [[ $count -lt $HEAD_NUM_RETRIES ]]; do
   if [[ -n "$SETUP_COMMAND_FILE" ]] && [[ -f "$SETUP_COMMAND_FILE" ]]; then
@@ -429,7 +459,7 @@ while [[ $count -lt $HEAD_NUM_RETRIES ]]; do
   fi
   # Two-level evaluation: heredoc expands $RAY_RESOURCES (with \") into text,
   # then bash re-parses it so \" inside double quotes becomes clean ".
-  cat <<EOFINNER | bash
+  if cat <<EOFINNER | bash; then
 ray start --head \
     --disable-usage-stats \
     --resources="$RAY_RESOURCES" \
@@ -446,16 +476,76 @@ ray start --head \
     --dashboard-agent-grpc-port=$((${DASHBOARD_AGENT_GRPC_PORT} + 1)) \
     --dashboard-agent-listen-port=$((${DASHBOARD_AGENT_LISTEN_PORT} + 1)) \
     --metrics-export-port=$((${METRICS_EXPORT_PORT} + 1)) \
-    $RAY_DEBUGGER_ARGS \
-    \
-    --block
+    $RAY_DEBUGGER_ARGS
 EOFINNER
+    break
+  fi
   count=$((count+1))
   echo "Head node failed $count/$HEAD_NUM_RETRIES times, restarting in 5 seconds..."
   sleep 5
 done
-touch "$LOG_DIR/ENDED"
-exit 1
+if [[ $count -ge $HEAD_NUM_RETRIES ]]; then
+  touch "$LOG_DIR/ENDED"
+  exit 1
+fi
+
+# Signal workers and submit host: Ray head GCS is now listening on $IP_HEAD.
+# Workers poll for this file before attempting ray start --address.
+touch "$LOG_DIR/STARTED_RAY_HEAD"
+
+if [[ -n "$DRIVER_COMMAND_FILE" ]]; then
+  # ── Non-interactive: poll for workers, then run the driver command ──
+  RAY_STATUS_DEADLINE=$((SECONDS + 1800))
+  while true; do
+    worker_units=$(ray status 2>/dev/null | grep "worker_units" | awk -F'[/. ]' '{print $4}' || echo 0)
+    echo "[INFO] Number of actors online: $worker_units/$NUM_ACTORS"
+    if [[ "$worker_units" -eq "$NUM_ACTORS" ]]; then
+      break
+    fi
+    if (( SECONDS > RAY_STATUS_DEADLINE )); then
+      echo "[ERROR] Timed out waiting for all workers to connect ($worker_units/$NUM_ACTORS after 30 min)"
+      touch "$LOG_DIR/ENDED"
+      exit 1
+    fi
+    sleep 5
+  done
+
+  echo "All workers connected!"
+
+  # Wait for all sandbox instances to be ready (if sandbox is configured).
+  # Each sandbox task touches SANDBOX_READY_<hostname> after its port is listening.
+  if [[ -n "$SANDBOX_PORTS_DIR" ]]; then
+    echo "[INFO] Waiting for sandbox to be ready on all $TOTAL_NUM_NODES nodes..."
+    SANDBOX_DEADLINE=$((SECONDS + 600))
+    while true; do
+      ready_count=$(ls -1 "$SANDBOX_PORTS_DIR"/SANDBOX_READY_* 2>/dev/null | wc -l)
+      if [[ "$ready_count" -ge "$TOTAL_NUM_NODES" ]]; then
+        break
+      fi
+      echo "[INFO] Sandbox ready on $ready_count/$TOTAL_NUM_NODES nodes..."
+      if (( SECONDS > SANDBOX_DEADLINE )); then
+        echo "[ERROR] Timed out waiting for sandbox ($ready_count/$TOTAL_NUM_NODES after 10 min)"
+        touch "$LOG_DIR/ENDED"
+        exit 1
+      fi
+      sleep 5
+    done
+    echo "[INFO] All $TOTAL_NUM_NODES sandbox instances ready."
+  fi
+
+  export NRL_RAY_READY_EPOCH=$(date +%s.%N)
+
+  set +e
+  bash "$DRIVER_COMMAND_FILE" > "$LOG_DIR/ray-driver.log" 2>&1
+  exit_code=$?
+  set -e
+  exit $exit_code
+else
+  # ── Interactive: keep the container alive for user attachment ──
+  # The user attaches via a separate srun --overlap (the attach script).
+  # sleep infinity is invisible to the attached session.
+  sleep infinity
+fi
 HEAD_BODY_EOF
 )
 
@@ -526,10 +616,10 @@ sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/conte
 
 source "$LOG_DIR/topology_probe.sh"
 
-echo "[INFO] Worker $SLURM_PROCID: waiting for Ray head container..."
+echo "[INFO] Worker $SLURM_PROCID: waiting for Ray head GCS to be ready..."
 while true; do
   if [[ -f "$LOG_DIR/STARTED_RAY_HEAD" ]]; then
-    echo "[INFO] Worker $SLURM_PROCID: Ray head container detected."
+    echo "[INFO] Worker $SLURM_PROCID: Ray head GCS is ready, connecting."
     break
   fi
   if [[ -f "$LOG_DIR/ENDED" ]]; then
@@ -585,43 +675,15 @@ WORKER_SCRIPT=$(printf '%s\n%s' "$BAKED_ENV" "$WORKER_BODY")
 bash -n <(printf '%s' "$HEAD_SCRIPT") || { echo "[FATAL] Head script has syntax errors" >&2; exit 1; }
 bash -n <(printf '%s' "$WORKER_SCRIPT") || { echo "[FATAL] Worker script has syntax errors" >&2; exit 1; }
 
-# Start head node
-srun $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$HEAD_SCRIPT" &
-SRUN_PIDS["ray-head"]=$!
-
-NUM_ACTORS=$((GPUS_PER_NODE * SLURM_JOB_NUM_NODES))
-
-# Start all worker nodes with a single multi-node srun.
-# srun -o with %t produces per-task log files: ray-worker-0.log, ray-worker-1.log, etc.
-srun $COMMON_SRUN_ARGS --container-name=ray-worker --exact \
-  --nodes=$((SLURM_JOB_NUM_NODES - 1)) \
-  --ntasks=$((SLURM_JOB_NUM_NODES - 1)) \
-  --ntasks-per-node=1 \
-  --cpus-per-task=$CPUS_PER_WORKER \
-  --kill-on-bad-exit=0 \
-  --exclude="$head_node" \
-  -o "$LOG_DIR/ray-worker-%t.log" \
-  bash -c "$WORKER_SCRIPT" &
-SRUN_PIDS["ray-workers"]=$!
-
-# Wait for the head container to signal it has started
-while check_srun_processes && ! test -f "$LOG_DIR/STARTED_RAY_HEAD"; do
-  echo "[INFO][$(date)] Waiting for head node container to start..."
-  sleep 2
-done
-
 ########################################################
-# Run sandbox in parallel on the head node (overlap)
+# Run sandbox in parallel on all nodes (overlap).
+# Each per-node task polls its own localhost port and writes a per-node
+# signal file so the head container can gate on all instances being ready.
 ########################################################
-export SLURM_MASTER_NODE=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
-
-# Check if SANDBOX_CONTAINER and SANDBOX_COMMAND are defined
+SANDBOX_PORT="${NEMO_SKILLS_SANDBOX_PORT:-6000}"
 if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
-  SANDBOX_PORTS_DIR="$LOG_DIR/sandbox"
-  mkdir -p "$SANDBOX_PORTS_DIR"
-  echo "[INFO] Starting sandbox on head node in parallel (ports_dir=$SANDBOX_PORTS_DIR)..."
-  srun --output "$LOG_DIR/sandbox.log" \
-    --error "$LOG_DIR/sandbox.log" \
+  echo "[INFO] Starting sandbox on all $SLURM_JOB_NUM_NODES nodes (ports_dir=$SANDBOX_PORTS_DIR, port=$SANDBOX_PORT)..."
+  srun --output "$SANDBOX_PORTS_DIR/sandbox-%t.log" \
     --container-image="$SANDBOX_CONTAINER" \
     --container-mounts="$SANDBOX_PORTS_DIR:$SANDBOX_PORTS_DIR" \
     --no-container-mount-home \
@@ -634,44 +696,84 @@ if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
     --nodes="$SLURM_JOB_NUM_NODES" \
     --ntasks-per-node=1 \
     --export=ALL,SANDBOX_PORTS_DIR=$SANDBOX_PORTS_DIR \
-    bash -c "$SANDBOX_COMMAND" &
+    bash -xc '
+      ('"$SANDBOX_COMMAND"') &
+      SANDBOX_PID=$!
+      deadline=$((SECONDS + 300))
+      while ! (echo > /dev/tcp/localhost/'"$SANDBOX_PORT"') 2>/dev/null; do
+        if ! kill -0 $SANDBOX_PID 2>/dev/null; then
+          echo "[ERROR] Sandbox process died before becoming ready on $(hostname)"
+          exit 1
+        fi
+        if (( SECONDS > deadline )); then
+          echo "[ERROR] Sandbox not ready on $(hostname) after 5 min"
+          exit 1
+        fi
+        sleep 2
+      done
+      touch '"$SANDBOX_PORTS_DIR"'/SANDBOX_READY_$(hostname)
+      echo "[INFO] Sandbox ready on $(hostname):'"$SANDBOX_PORT"'"
+      wait $SANDBOX_PID
+    ' &
   SRUN_PIDS["sandbox"]=$!
   echo "[INFO] Sandbox started in background (PID: ${SRUN_PIDS["sandbox"]})"
 else
   echo "[INFO] SANDBOX_CONTAINER or SANDBOX_COMMAND not defined, skipping sandbox startup"
 fi
 
-# At this stage the Ray cluster bringup has started on the physical nodes in the allocation
-# Before we launch a job on this cluster we need to make sure that the bringup is complete
-# We do so by querying the number of worker_units in the ray cluster and asserting = NUM_ACTORS
+# Start head node
+srun $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$HEAD_SCRIPT" &
+SRUN_PIDS["ray-head"]=$!
 
-# Poll for all Ray workers to connect by reading the file written by ray-status-sidecar in the head container
-RAY_STATUS_DEADLINE=$((SECONDS + 1800))
-while true; do
-  worker_units=$(cat "$LOG_DIR/ray_worker_units" 2>/dev/null || echo -1)
-  echo "[INFO] Number of actors online: $worker_units/$NUM_ACTORS"
-  if [[ "$worker_units" -eq "$NUM_ACTORS" ]]; then
-    break
-  fi
-  check_srun_processes
-  if (( SECONDS > RAY_STATUS_DEADLINE )); then
-    echo "[ERROR] Timed out waiting for all workers to connect ($worker_units/$NUM_ACTORS after 30 min)"
-    touch "$LOG_DIR/ENDED"
-    exit 1
-  fi
-  sleep 5
+# Start all worker nodes with a single multi-node srun.
+# srun -o with %t produces per-task log files: ray-worker-0.log, ray-worker-1.log, etc.
+srun $COMMON_SRUN_ARGS --container-name=ray-worker --exact \
+  --nodes=$((SLURM_JOB_NUM_NODES - 1)) \
+  --ntasks=$((SLURM_JOB_NUM_NODES - 1)) \
+  --ntasks-per-node=1 \
+  --cpus-per-task=$CPUS_PER_WORKER \
+  --kill-on-bad-exit=0 \
+  --exclude="$head_node" \
+  -o "$LOG_DIR/ray-worker-%t.log" \
+  bash -xc "$WORKER_SCRIPT" &
+SRUN_PIDS["ray-workers"]=$!
+
+# Wait for the Ray head GCS to be ready
+# signal file is touched after ray start --head succeeds
+while check_srun_processes && ! test -f "$LOG_DIR/STARTED_RAY_HEAD"; do
+  echo "[INFO][$(date)] Waiting for Ray head GCS to be ready..."
+  sleep 2
 done
 
-echo "All workers connected!"
-export NRL_RAY_READY_EPOCH=$(date +%s.%N)
-
-# We can now launch a job on this cluster
-# We do so by launching a driver process on the physical node that the head node is on
-# This driver process is responsible for launching a job on the Ray cluster
-CONTAINER_CWD=$(scontrol show job $SLURM_JOB_ID | grep -oP 'WorkDir=\K[^ ]+' | head -1)
 if [[ -n "$COMMAND" ]]; then
-  srun --no-container-mount-home --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" -o $LOG_DIR/ray-driver.log bash -c "export NRL_RAY_READY_EPOCH=$NRL_RAY_READY_EPOCH && $COMMAND"
+  # Non-interactive: head container handles polling + command execution
+  # The head srun exits when the command finishes (or on failure).
+  set +e
+  wait ${SRUN_PIDS["ray-head"]}
+  exit_code=$?
+  set -e
+  exit $exit_code
 else
+  # Interactive: poll for workers from submit host, then idle
+  RAY_STATUS_DEADLINE=$((SECONDS + 1800))
+  while true; do
+    worker_units=$(cat "$LOG_DIR/ray_worker_units" 2>/dev/null || echo -1)
+    echo "[INFO] Number of actors online: $worker_units/$NUM_ACTORS"
+    if [[ "$worker_units" -eq "$NUM_ACTORS" ]]; then
+      break
+    fi
+    check_srun_processes
+    if (( SECONDS > RAY_STATUS_DEADLINE )); then
+      echo "[ERROR] Timed out waiting for all workers to connect ($worker_units/$NUM_ACTORS after 30 min)"
+      touch "$LOG_DIR/ENDED"
+      exit 1
+    fi
+    sleep 5
+  done
+
+  echo "All workers connected!"
+
+  CONTAINER_CWD=$(scontrol show job $SLURM_JOB_ID | grep -oP 'WorkDir=\K[^ ]+' | head -1)
   echo "[INFO]: Ray Cluster is idled, run this on the slurm head node to get a shell to the head node:"
   cat <<EOF >$SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh
 # No args launches on the head node (node 0)
@@ -687,7 +789,7 @@ if [[ -z "\$WORKER_NUM" ]]; then
   fi
 else
   # Worker numbers 1 through N-1 map to nodes_array[1] through nodes_array[N-1]
-  # Log files are 0-indexed: worker K has ray-worker-$((K-1)).log
+  # Log files are 0-indexed: worker K has ray-worker-(K-1).log
   if [[ \$WORKER_NUM -lt 1 || \$WORKER_NUM -ge $SLURM_JOB_NUM_NODES ]]; then
     echo "Error: WORKER_NUM must be between 1 and $((SLURM_JOB_NUM_NODES-1))"
     exit 1
