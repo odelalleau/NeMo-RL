@@ -745,21 +745,27 @@ fi
 srun $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$HEAD_SCRIPT" &
 SRUN_PIDS["ray-head"]=$!
 
-# Start all worker nodes with a single multi-node srun.
-# srun -o with %t produces per-task log files
-# Zero-pad to the width of the worker count so filenames sort naturally
+# Start worker nodes (all nodes except the head).
+# In single-node mode (_num_workers=0), the head is the only compute node
+# and already registers its GPUs as Ray resources, so no workers are needed.
 _num_workers=$((SLURM_JOB_NUM_NODES - 1))
-_task_digits=${#_num_workers}
-srun $COMMON_SRUN_ARGS --container-name=ray-worker --exact \
-  --nodes=$_num_workers \
-  --ntasks=$_num_workers \
-  --ntasks-per-node=1 \
-  --cpus-per-task=$CPUS_PER_WORKER \
-  --kill-on-bad-exit=0 \
-  --exclude="$head_node" \
-  -o "$LOG_DIR/ray-worker-%0${_task_digits}t.log" \
-  bash -xc "$WORKER_SCRIPT" &
-SRUN_PIDS["ray-workers"]=$!
+if [[ $_num_workers -gt 0 ]]; then
+  # srun -o with %t produces per-task log files
+  # Zero-pad to the width of the worker count so filenames sort naturally
+  _task_digits=${#_num_workers}
+  srun $COMMON_SRUN_ARGS --container-name=ray-worker --exact \
+    --nodes=$_num_workers \
+    --ntasks=$_num_workers \
+    --ntasks-per-node=1 \
+    --cpus-per-task=$CPUS_PER_WORKER \
+    --kill-on-bad-exit=0 \
+    --exclude="$head_node" \
+    -o "$LOG_DIR/ray-worker-%0${_task_digits}t.log" \
+    bash -xc "$WORKER_SCRIPT" &
+  SRUN_PIDS["ray-workers"]=$!
+else
+  echo "[INFO] Single-node mode: head node is the only compute node, no workers to launch"
+fi
 
 # Wait for the Ray head GCS to be ready
 # signal file is touched after ray start --head succeeds
@@ -804,15 +810,15 @@ else
 # Optional: set COMMAND='...' to run non-interactively instead of opening an interactive shell
 WORKER_NUM=\${1:-}
 if [[ -z "\$WORKER_NUM" ]]; then
-  # Empty means we are on the head node
   if [[ -n "\${COMMAND:-}" ]]; then
     srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID bash -c "\$COMMAND"
   else
     srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty bash
   fi
+elif [[ $SLURM_JOB_NUM_NODES -eq 1 ]]; then
+  echo "Error: Single-node mode — only the head node is available. Run without arguments."
+  exit 1
 else
-  # Worker numbers 1 through N-1 map to nodes_array[1] through nodes_array[N-1]
-  # Log files are 0-indexed: worker K has ray-worker-(K-1).log
   if [[ \$WORKER_NUM -lt 1 || \$WORKER_NUM -ge $SLURM_JOB_NUM_NODES ]]; then
     echo "Error: WORKER_NUM must be between 1 and $((SLURM_JOB_NUM_NODES-1))"
     exit 1
@@ -829,8 +835,10 @@ EOF
   chmod +x $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh
   echo "     COMMAND='echo hello' bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh    # run a non-interactive command on head node"
   echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh    # to attach to head node (i.e., 'worker 0')"
-  echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh 1  # to attach to worker 1"
-  echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh 2  # to attach to worker 2, etc."
+  if [[ $SLURM_JOB_NUM_NODES -gt 1 ]]; then
+    echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh 1  # to attach to worker 1"
+    echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh 2  # to attach to worker 2, etc."
+  fi
   sleep infinity
 fi
 
