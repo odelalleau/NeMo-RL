@@ -101,11 +101,12 @@ class BaseVllmGenerationWorker:
             env_vars["VLLM_CACHE_ROOT"] = os.environ.get("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm")) + f"_{seed}"
 
             # Give each vLLM engine a deterministic starting port for TP/DP
-            # rendezvous, outside the OS ephemeral range (32768-60999) and
-            # non-overlapping with NeMo RL (11001-15000) and Gym (15001-20000).
+            # rendezvous, below the OS ephemeral range floor (9000 on OCI-HSG,
+            # 32768 on stock Linux) and non-overlapping with other services.
+            # See ray.sub port layout comment for the full allocation map.
             # vLLM's _get_open_port() reads VLLM_PORT and auto-increments on
             # collision, so 100-port spacing per engine provides headroom.
-            _VLLM_PORT_RANGE_LOW = 20001
+            _VLLM_PORT_RANGE_LOW = 7000
             _VLLM_PORTS_PER_ENGINE = 100
             if len(local_bundle_indices) == 1:
                 engine_index_on_node = local_bundle_indices[0]

@@ -221,8 +221,8 @@ policy:
   scheduler: null
 
   generation:
-    port_range_low: 11001
-    port_range_high: 15000
+    port_range_low: 3000
+    port_range_high: 4999
     backend: "vllm"
     max_new_tokens: ${policy.max_total_sequence_length}
     temperature: 1.0
@@ -288,8 +288,8 @@ env:
   genrm_compare_server_name: "genrm_compare"
   nemo_gym:
     num_gpu_nodes: 4
-    port_range_low: 15001
-    port_range_high: 20000
+    port_range_low: 5000
+    port_range_high: 5999
     invalid_tool_call_patterns:
       - "<tool_call>"
       - "</tool_call>"
