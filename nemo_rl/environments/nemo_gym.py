@@ -107,14 +107,14 @@ class NemoGym(EnvironmentInterface):
         )
         initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
 
-        # Gym servers default to 15001-20000 so they don't collide with NeMo RL
-        # master-address ports (11001-15000) or vLLM engine ports (20001+).
-        _gym_port_low = self.cfg.get("port_range_low", 15001)
-        _gym_port_high = self.cfg.get("port_range_high", 20000)
-        if _gym_port_low < 15001 or _gym_port_high > 20000:
+        # Gym servers default to 5000-5999, below the OS ephemeral floor (9000
+        # on OCI-HSG).  See ray.sub port layout comment for the full map.
+        _gym_port_low = self.cfg.get("port_range_low", 5000)
+        _gym_port_high = self.cfg.get("port_range_high", 5999)
+        if _gym_port_low < 5000 or _gym_port_high > 5999:
             print(
-                f"WARNING: Gym port range [{_gym_port_low}, {_gym_port_high}) overlaps "
-                f"with NeMo RL (11001-15000) or vLLM (20001+). Consider adjusting."
+                f"WARNING: Gym port range [{_gym_port_low}, {_gym_port_high}) is outside "
+                f"the expected 5000-5999 band. Check ray.sub port layout for conflicts."
             )
         initial_global_config_dict["port_range_low"] = _gym_port_low
         initial_global_config_dict["port_range_high"] = _gym_port_high

@@ -72,8 +72,8 @@ class PY_EXECUTABLES:
 # We avoid the OS ephemeral range (typically 32768-60999 on Linux) because
 # those ports can be grabbed by unrelated processes between the time we
 # probe and the time the distributed framework actually binds.
-DEFAULT_PORT_RANGE_LOW = 11001
-DEFAULT_PORT_RANGE_HIGH = 15000
+DEFAULT_PORT_RANGE_LOW = 3000
+DEFAULT_PORT_RANGE_HIGH = 4999
 
 # ---------------------------------------------------------------------------
 # Topology resource keys
