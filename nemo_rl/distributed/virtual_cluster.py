@@ -250,33 +250,30 @@ def init_ray(log_dir: Optional[str] = None) -> None:
 
 
 @ray.remote(num_gpus=1)
-class GetGPUIDActor:  # pragma: no cover
-    """Actor that returns GPU ID and topology info for the current worker's bundle.
+def _get_gpu_id_info() -> tuple[int, str, int]:  # pragma: no cover
+    """Return (gpu_id, nvlink_domain, topo_rank) for the current worker's bundle.
 
     Reads custom resources set by ray.sub (see NVLINK_DOMAIN_PREFIX / TOPO_RANK_KEY).
     """
-
-    def get_info(self) -> tuple[int, str, int]:
-        """Return (gpu_id, nvlink_domain, topo_rank) for this actor's bundle."""
-        gpu_id = ray.get_gpu_ids()[0]
-        nvlink_domain = NVLINK_DOMAIN_UNKNOWN
-        topo_rank = TOPO_RANK_UNKNOWN
-        try:
-            runtime_ctx = ray.get_runtime_context()
-            node_id = runtime_ctx.get_node_id()
-            all_node_resources = {}
-            for node in ray.nodes():
-                if node.get("NodeID") == node_id:
-                    all_node_resources = node.get("Resources", {})
-                    break
-            for key, val in all_node_resources.items():
-                if key.startswith(NVLINK_DOMAIN_PREFIX):
-                    nvlink_domain = key
-                if key == TOPO_RANK_KEY:
-                    topo_rank = int(val)
-        except Exception:
-            pass
-        return gpu_id, nvlink_domain, topo_rank
+    gpu_id = ray.get_gpu_ids()[0]
+    nvlink_domain = NVLINK_DOMAIN_UNKNOWN
+    topo_rank = TOPO_RANK_UNKNOWN
+    try:
+        runtime_ctx = ray.get_runtime_context()
+        node_id = runtime_ctx.get_node_id()
+        all_node_resources = {}
+        for node in ray.nodes():
+            if node.get("NodeID") == node_id:
+                all_node_resources = node.get("Resources", {})
+                break
+        for key, val in all_node_resources.items():
+            if key.startswith(NVLINK_DOMAIN_PREFIX):
+                nvlink_domain = key
+            if key == TOPO_RANK_KEY:
+                topo_rank = int(val)
+    except Exception:
+        pass
+    return gpu_id, nvlink_domain, topo_rank
 
 
 class ResourceInsufficientError(Exception):
@@ -785,11 +782,12 @@ class RayVirtualCluster:
         num_bundles = len(pg_data["bundles"])
         bundle_to_node_ids = pg_data["bundles_to_node_id"]
 
-        # use info actor to get the topology information for each bundle
-        info_actors = []
+        # Use fire-and-forget tasks to get topology info for each bundle
+        # Tasks reuse the raylet's worker pool and avoid GCS actor registrations
+        info_refs = []
         for i in range(num_bundles):
-            info_actors.append(
-                GetGPUIDActor.options(
+            info_refs.append(
+                _get_gpu_id_info.options(
                     num_cpus=0.01,  # set both num_cpus and num_gpus to be small values to enable assignment in colocated case
                     num_gpus=0.01,
                     resources=None,
@@ -800,9 +798,7 @@ class RayVirtualCluster:
                 ).remote()
             )
 
-        infos = ray.get([actor.get_info.remote() for actor in info_actors])
-        for actor in info_actors:
-            ray.kill(actor)
+        infos = ray.get(info_refs)
 
         gpu_ids = []
         nvlink_domains = []
@@ -856,15 +852,14 @@ class RayVirtualCluster:
 
 
 @ray.remote  # pragma: no cover
-class RayClusterSetupHelper:
-    def __init__(self, *init_args, **init_kwargs):
-        self.init_args = init_args
-        self.init_kwargs = init_kwargs
+def _get_node_info() -> dict:
+    """Return node_id and node_ip for the current worker.
 
-    def _get_node_info(self) -> dict:
-        try:
-            node_id = ray.get_runtime_context().get_node_id()
-        except Exception:
-            node_id = None
-        node_ip = get_node_ip_address()
-        return {"node_id": node_id, "node_ip": node_ip}
+    Uses a Ray task (not an actor) to avoid GCS actor registration overhead.
+    """
+    try:
+        node_id = ray.get_runtime_context().get_node_id()
+    except Exception:
+        node_id = None
+    node_ip = get_node_ip_address()
+    return {"node_id": node_id, "node_ip": node_ip}
