@@ -76,7 +76,7 @@ from nemo_rl.distributed.virtual_cluster import (
     NVLINK_DOMAIN_UNKNOWN,
     TOPO_RANK_UNKNOWN,
     ClusterConfig,
-    RayClusterSetupHelper,
+    _get_node_info,
     RayVirtualCluster,
     get_ray_cluster_topology,
     select_segment_nodes,
@@ -644,19 +644,20 @@ def setup(
                 )
             nemo_gym_judge_pgs.append(helper_pg)
 
-        helpers = []
+        node_info_refs = []
         for nemo_gym_node_idx in range(nemo_gym_num_nodes):
             helper_pg = nemo_gym_judge_pgs[nemo_gym_node_idx]
-            helper_options = {}
-            helper_options["num_gpus"] = nemo_gym_num_gpus_per_node
-            helper_options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
-                placement_group=helper_pg,
-                placement_group_capture_child_tasks=True,
+            node_info_refs.append(
+                _get_node_info.options(
+                    num_gpus=nemo_gym_num_gpus_per_node,
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=helper_pg,
+                        placement_group_capture_child_tasks=True,
+                    ),
+                ).remote()
             )
-            helper = RayClusterSetupHelper.options(**helper_options).remote()
-            helper_node_info = ray.get(helper._get_node_info.remote())
-            helpers.append(helper)
-            nemo_gym_nodes.append(helper_node_info)
+
+        nemo_gym_nodes.extend(ray.get(node_info_refs))
 
         for nemo_gym_node_idx in range(nemo_gym_num_nodes):
             node_id = nemo_gym_nodes[nemo_gym_node_idx]["node_id"]
@@ -665,9 +666,6 @@ def setup(
                 node_id = node_infos[node_ip]["node_id"]
                 assert node_id
                 nemo_gym_nodes[nemo_gym_node_idx]["node_id"] = node_id
-
-        for helper in helpers:
-            ray.kill(helper, no_restart=True)
 
         print(
             f"  ✓ Ray cluster for NeMo Gym reserved with {nemo_gym_num_nodes} nodes",
