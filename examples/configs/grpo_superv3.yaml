@@ -199,6 +199,10 @@ policy:
       fp8_recipe: "blockwise"
       fp8_param: false
 
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 1
+    num_layers_at_end_in_bf16: 1
+
     env_vars: null
 
   dynamic_batching:

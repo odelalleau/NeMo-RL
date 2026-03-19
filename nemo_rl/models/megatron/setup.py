@@ -487,6 +487,11 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
                 "Refer to https://github.com/NVIDIA-NeMo/RL/issues/1164 for latest updates with this issue."
             )
 
+    # first/last layer precision configuration
+    model_cfg.first_last_layers_bf16 = config["megatron_cfg"]["first_last_layers_bf16"]
+    model_cfg.num_layers_at_start_in_bf16 = config["megatron_cfg"]["num_layers_at_start_in_bf16"]
+    model_cfg.num_layers_at_end_in_bf16 = config["megatron_cfg"]["num_layers_at_end_in_bf16"]
+
 
 def _validate_optimizer_config(config: PolicyConfig) -> None:
     """Validate optimizer configuration."""
