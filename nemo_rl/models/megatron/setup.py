@@ -229,6 +229,9 @@ def validate_and_set_config(
         config, rank, dtype, hf_model_name, pretrained_path, weights_path
     )
 
+    if "use_gloo_process_groups" in config["megatron_cfg"]:
+        megatron_cfg.dist.use_gloo_process_groups = config["megatron_cfg"]["use_gloo_process_groups"]
+
     final_padded_vocab_size = calculate_padded_vocab_size(
         megatron_cfg.model.vocab_size,
         megatron_cfg.model.make_vocab_size_divisible_by,
