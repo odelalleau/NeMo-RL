@@ -36,6 +36,7 @@ hf_datasets_cache/
 docker/*
 !docker/Dockerfile
 !docker/Dockerfile.ngc_pytorch
+!docker/build-vllm-sqsh.sh
 !docker/README.md
 wandb/
 checkpoints/
