@@ -263,6 +263,14 @@ done
 unset _sorted_pairs _pair _si
 echo "[INFO] Nodes after hostname sort: ${nodes_array[*]}"
 
+# Dump hostname→IP mapping to log directory for post-mortem diagnostics.
+# Format: "hostname ip" per line, easily consumed by diagnose_job.sh.
+NODE_IP_MAP="$LOG_DIR/node-ip-map.txt"
+for (( _mi = 0; _mi < ${#nodes_array[@]}; _mi++ )); do
+  echo "${nodes_array[$_mi]} ${ip_addresses_array[$_mi]}"
+done > "$NODE_IP_MAP"
+echo "[INFO] Wrote hostname→IP map to $NODE_IP_MAP (${#nodes_array[@]} entries)"
+
 head_node=${nodes_array[0]}
 head_node_ip=${ip_addresses_array[0]}
 
