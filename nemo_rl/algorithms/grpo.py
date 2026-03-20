@@ -1689,6 +1689,7 @@ def grpo_train(
     memory_tracker = MemoryTracker()
 
     kv_scales_cache = None  # Cache reused for computed kv scales
+    pending_checkpoint_path: Optional[str] = None  # deferred async checkpoint finalization
 
     NEED_REFIT = True
     # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
@@ -2446,6 +2447,12 @@ def grpo_train(
                             ]
 
                     with timer.time("checkpointing"):
+                        # Finalize previous async checkpoint if pending
+                        if pending_checkpoint_path is not None:
+                            policy.finalize_async_save()
+                            checkpointer.finalize_checkpoint(pending_checkpoint_path)
+                            pending_checkpoint_path = None
+
                         print(
                             f"Saving checkpoint for step {total_steps + 1}...",
                             flush=True,
@@ -2469,7 +2476,9 @@ def grpo_train(
                             dataloader.state_dict(),
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                        # Defer directory rename until next save or loop exit.
+                        # With sync save, finalize_async_save is a no-op.
+                        pending_checkpoint_path = checkpoint_path
 
             # Logging
             # Log training data
@@ -2621,10 +2630,16 @@ def grpo_train(
             current_step += 1
             total_steps += 1
             if should_save_by_timeout:
+                if pending_checkpoint_path is not None:
+                    policy.finalize_async_save()
+                    checkpointer.finalize_checkpoint(pending_checkpoint_path)
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
             if total_steps >= max_num_steps:
+                if pending_checkpoint_path is not None:
+                    policy.finalize_async_save()
+                    checkpointer.finalize_checkpoint(pending_checkpoint_path)
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print(
                     "Max number of steps has been reached, stopping training early",
@@ -2892,6 +2907,7 @@ def async_grpo_train(
     total_valid_tokens = grpo_save_state.get(
         "total_valid_tokens", 0
     )  # Default to 0 for backward compatibility with older checkpoints
+    pending_checkpoint_path: Optional[str] = None  # deferred async checkpoint finalization
     val_period = master_config["grpo"]["val_period"]
     val_at_start = master_config["grpo"]["val_at_start"]
     val_at_end = master_config["grpo"]["val_at_end"]
@@ -3674,6 +3690,12 @@ def async_grpo_train(
                             ]
 
                     with timer.time("checkpointing"):
+                        # Finalize previous async checkpoint if pending
+                        if pending_checkpoint_path is not None:
+                            policy.finalize_async_save()
+                            checkpointer.finalize_checkpoint(pending_checkpoint_path)
+                            pending_checkpoint_path = None
+
                         print(f"Saving checkpoint for step {step + 1}...")
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
                             step + 1, grpo_save_state, master_config
@@ -3710,7 +3732,8 @@ def async_grpo_train(
                         print(
                             f"✅ Saved replay buffer with {len(replay_buffer_state['trajectories'])} trajectories"
                         )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                        # Defer directory rename until next save or training exit.
+                        pending_checkpoint_path = checkpoint_path
 
                         # Record checkpoint completion for crash-recovery analysis
                         cp_info_path = os.path.join(
@@ -3846,9 +3869,17 @@ def async_grpo_train(
             timer.reset()
             step += 1
             if should_save_by_timeout:
+                if pending_checkpoint_path is not None:
+                    policy.finalize_async_save()
+                    checkpointer.finalize_checkpoint(pending_checkpoint_path)
+                    pending_checkpoint_path = None
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
             if step >= master_config["grpo"]["max_num_steps"]:
+                if pending_checkpoint_path is not None:
+                    policy.finalize_async_save()
+                    checkpointer.finalize_checkpoint(pending_checkpoint_path)
+                    pending_checkpoint_path = None
                 print(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
@@ -3862,6 +3893,14 @@ def async_grpo_train(
         traceback.print_exc()
 
     finally:
+        # Finalize any pending async checkpoint before shutting down workers
+        if pending_checkpoint_path is not None:
+            try:
+                policy.finalize_async_save()
+                checkpointer.finalize_checkpoint(pending_checkpoint_path)
+            except Exception as e:
+                print(f"Error finalizing pending checkpoint: {e}")
+
         # Clean up
         print("🛑 Stopping trajectory collection...")
         try:

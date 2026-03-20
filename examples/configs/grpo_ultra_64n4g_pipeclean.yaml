@@ -248,6 +248,13 @@ policy:
     num_layers_at_start_in_bf16: 1
     num_layers_at_end_in_bf16: 1
 
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
+      fully_parallel_save_process_group: "ep_dp"
+      fully_parallel_load_process_group: "ep_dp"
+      fully_parallel_load_exchange_algo: "broadcast"
+
     env_vars: null
 
   # ---------------------------------------------------------------------------
