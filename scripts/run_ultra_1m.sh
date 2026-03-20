@@ -4,7 +4,7 @@ WORK_DIR=$(pwd)
 LUSTRE_DIR=/lustre
 ACCOUNT=${ACCOUNT:-llmservice_nemotron_ultra}
 
-CONTAINER_IMAGE=${CONTAINER_IMAGE:-/lustre/fsw/portfolios/llmservice/users/dmosallanezh/containers/vllm-hsg-03-16.sqsh}
+CONTAINER_IMAGE=${CONTAINER_IMAGE:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nemotron_ultra/vllm/images/high_stripe/vllm-hsg-nightly.sqsh}
 MODEL=${MODEL:-/lustre/fsw/portfolios/llmservice/users/soumyes/sft-runs/eval_and_sleep/ultra-v3-sft-bf16-hybridep-ep64-cp32-bindpcie-recompute-offload-mar13-blend-512k-filt-1e-5/iter_0001000/hf}
 REASONING_PARSER=${REASONING_PARSER:-/lustre/fsw/portfolios/llmservice/users/lvega/evals/ultra_v3_reasoning_parser.py}
 TIME=${TIME:-04:00:00}
@@ -83,7 +83,7 @@ srun -A ${ACCOUNT} \
         tail -f "${LOG_FILE}" &
         TAIL_PID=$!
 
-        while ! grep -q "Uvicorn running on" "${LOG_FILE}" 2>/dev/null; do
+        while ! grep -q "Application startup complete" "${LOG_FILE}" 2>/dev/null; do
             if ! kill -0 "$VLLM_PID" 2>/dev/null; then
                 echo "ERROR: vLLM server process died"
                 kill "$TAIL_PID" 2>/dev/null || true
