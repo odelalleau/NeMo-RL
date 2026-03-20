@@ -361,7 +361,8 @@ def _get_module_from_param_name(model, name: str):
             else:
                 current_module = getattr(current_module, part)
     except (AttributeError, IndexError, ValueError) as e:
-        print(f"Warning: Could not find module for parameter '{name}'. Error: {e}")
+        truncated_error_message = str(e)[:1000]
+        print(f"Warning: Could not find module for parameter '{name}'. Error: {truncated_error_message}")
     return current_module
 
 
