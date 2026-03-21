@@ -537,12 +537,18 @@ def _create_checkpoint_config(
         ckpt_cfg: Optional MegatronCheckpointConfig dict from YAML.
     """
     cfg = ckpt_cfg or {}
+    async_save = cfg.get("async_save", False)
+    # Megatron-Bridge requires checkpoint.save != None when async_save is enabled.
+    # The actual path is overwritten by save_checkpoint() before each write.
+    save_path = weights_path
+    if async_save and save_path is None:
+        save_path = pretrained_path
     kwargs: dict[str, Any] = dict(
         save_interval=100,
-        save=weights_path,
+        save=save_path,
         load=weights_path,
         pretrained_checkpoint=pretrained_path,
-        async_save=cfg.get("async_save", False),
+        async_save=async_save,
         fully_parallel_save=True,
         fully_parallel_load=True,
         load_rng=False,
