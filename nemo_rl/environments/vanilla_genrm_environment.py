@@ -200,7 +200,9 @@ class VanillaGenRMWorker:
             }
 
         except Exception:
-            self.logger.exception(f"Unexpected error parsing response:\n{response}\n{repr(json_str)}\nError:")
+            # The detailed exception traceback is currently commented out so as to avoid spam in logs.
+            # self.logger.exception(f"Unexpected error parsing response:\n{response}\n{repr(json_str)}\nError:")
+            self.logger.warning(f"Unexpected error parsing response:\n{response}\n{repr(json_str)}")
             return {
                 "score_1": None,
                 "score_2": None,
