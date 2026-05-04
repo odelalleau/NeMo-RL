@@ -527,6 +527,7 @@ def grpo_train(
                 input_ids = batched_flat["token_ids"]
 
             # Generate responses - this updates the LLMMessageLogType in repeated_batch
+            print(f"▶ DBG: {input_ids.shape=}")
             print(f"▶ Generating responses for batch of size {repeated_batch.size}...")
             with timer.time("prepare_for_generation"):
                 if NEED_REFIT and POLICY_GENERATION_STALE:
