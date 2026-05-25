@@ -777,6 +777,7 @@ if [[ $_num_workers -gt 0 ]]; then
   # srun -o with %t produces per-task log files
   # Zero-pad to the width of the worker count so filenames sort naturally
   _task_digits=${#_num_workers}
+  echo "Starting $_num_workers Ray workers..."
   srun $COMMON_SRUN_ARGS --container-name=ray-worker --exact \
     --nodes=$_num_workers \
     --ntasks=$_num_workers \
@@ -787,6 +788,7 @@ if [[ $_num_workers -gt 0 ]]; then
     -o "$LOG_DIR/ray-worker-%0${_task_digits}t.log" \
     bash -xc "$WORKER_SCRIPT" &
   SRUN_PIDS["ray-workers"]=$!
+  echo "Started $_num_workers Ray workers!"
 else
   echo "[INFO] Single-node mode: head node is the only compute node, no workers to launch"
 fi
