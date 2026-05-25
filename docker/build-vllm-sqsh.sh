@@ -21,6 +21,11 @@
 ###############################################################################
 set -euo pipefail
 
+# This script may be broken because we removed a secret present in the internal version.
+# This is the secret from commit 96478700c.
+# See diff between 3a41bdd44 and a13314b44 to see what was removed.
+exit 1
+
 VLLM_REPO="${VLLM_REPO:-https://github.com/TomerBN-Nvidia/vllm.git}"
 VLLM_BRANCH="${VLLM_BRANCH:-ultra-rl-v0.17}"
 FLASHINFER_REPO="${FLASHINFER_REPO:-https://github.com/TomerBN-Nvidia/flashinfer.git}"
