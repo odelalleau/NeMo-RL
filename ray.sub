@@ -767,14 +767,14 @@ fi
 
 # Start head node
 echo "Starting Ray head node with srun..."
-HEAD_SCRIPT="echo LAUNCHED RAY HEAD"
-echo $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$HEAD_SCRIPT"
+#HEAD_SCRIPT="echo LAUNCHED RAY HEAD"
+#echo $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$HEAD_SCRIPT"
 srun $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$HEAD_SCRIPT" &
 echo "Started Ray head node with srun!"
 SRUN_PIDS["ray-head"]=$!
 
-sleep 1800
-exit 0
+# sleep 1800
+# exit 0
 
 # Start worker nodes (all nodes except the head).
 # In single-node mode (_num_workers=0), the head is the only compute node
