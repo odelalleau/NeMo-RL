@@ -184,6 +184,8 @@ CPUS_PER_WORKER=${CPUS_PER_WORKER:-140}
 
 num_retries=3
 
+echo "SLURM_CPUS_ON_NODE=$SLURM_CPUS_ON_NODE"
+
 # Track backgrounded srun client PIDs for head and workers
 declare -A SRUN_PIDS
 
