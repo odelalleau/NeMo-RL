@@ -295,7 +295,7 @@ policy:
       async_engine: true
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
-      tensor_parallel_size: 8
+      tensor_parallel_size: ${policy.megatron_cfg.tensor_model_parallel_size}
       pipeline_parallel_size: 1
       expert_parallel_size: 1
       gpu_memory_utilization: 0.85
