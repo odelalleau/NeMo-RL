@@ -1072,7 +1072,7 @@ class AsyncTrajectoryCollector:
         prompt_idx: int,
         retry_count: int = 0,
     ) -> None:
-        MAX_RETRIES = 3
+        MAX_RETRIES = 6
         RETRY_DELAY_BASE = 1.0  # seconds
         _retry_spawned = False  # Flag to skip finally cleanup when retry is spawned
 
