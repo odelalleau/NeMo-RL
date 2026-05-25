@@ -131,6 +131,9 @@ if [[ -n "${UV_CACHE_DIR_OVERRIDE:-}" ]]; then
   fi
 fi
 
+# Ensure the SLURM submit dir is mounted as well (this is not always guaranteed).
+MOUNTS=$MOUNTS,$SLURM_SUBMIT_DIR:$SLURM_SUBMIT_DIR
+
 # Create logs directory
 # NOTE: LOG_DIR must be on a shared filesystem visible to both the submit host and all compute nodes.
 # File-based signaling between the submit host and containers 
