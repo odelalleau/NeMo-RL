@@ -23,7 +23,7 @@
 # limitations under the License.
 
 
-set -eoux pipefail
+set -eou pipefail
 
 # Record job-start epoch so Python can measure pre-Python overhead
 export NRL_JOB_START_EPOCH=$(date +%s.%N)
@@ -696,8 +696,12 @@ WORKER_BODY_EOF
 HEAD_SCRIPT=$(printf '%s\n%s' "$BAKED_ENV" "$HEAD_BODY")
 WORKER_SCRIPT=$(printf '%s\n%s' "$BAKED_ENV" "$WORKER_BODY")
 
+
+echo "LAUNCHING HEAD_SCRIPT"
 [[ -z "$HEAD_SCRIPT" ]] && echo "[FATAL] HEAD_SCRIPT is empty" >&2 && exit 1
+echo "LAUNCHING WORKER_SCRIPT"
 [[ -z "$WORKER_SCRIPT" ]] && echo "[FATAL] WORKER_SCRIPT is empty" >&2 && exit 1
+echo "LAUNCHED_BOTH"
 
 bash -n <(printf '%s' "$HEAD_SCRIPT") || { echo "[FATAL] Head script has syntax errors" >&2; exit 1; }
 bash -n <(printf '%s' "$WORKER_SCRIPT") || { echo "[FATAL] Worker script has syntax errors" >&2; exit 1; }
