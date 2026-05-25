@@ -765,7 +765,9 @@ else
 fi
 
 # Start head node
+echo "Starting Ray head node with srun..."
 srun $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$HEAD_SCRIPT" &
+echo "Started Ray head node with srun!"
 SRUN_PIDS["ray-head"]=$!
 
 # Start worker nodes (all nodes except the head).
