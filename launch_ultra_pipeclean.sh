@@ -122,7 +122,7 @@ SLURM_QOS="${SLURM_QOS:-}"
 WALLTIME="${WALLTIME:-4:00:00}"
 
 # ---------- Container & mounts ----------
-export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nemotron_ultra/nemo_rl/images/high_stripe/pipe.46035436.sqsh}"
+export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nemotron_ultra/nemo_rl/images/high_stripe/rl.nightly.sqsh}"
 MOUNTS="/lustre:/lustre"
 
 # GB200 NVL72: fixed at 4 GPUs/node. Must match --gres=gpu:4 passed to sbatch.
