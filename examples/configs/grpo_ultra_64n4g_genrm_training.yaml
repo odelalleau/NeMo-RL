@@ -153,7 +153,7 @@ policy:
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
-    activation_checkpointing: false
+    activation_checkpointing: true
 
     tensor_model_parallel_size: 8
     expert_tensor_parallel_size: 1
