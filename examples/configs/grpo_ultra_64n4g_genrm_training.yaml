@@ -141,8 +141,8 @@ policy:
   offload_optimizer_for_logprob: false
 
   dtensor_cfg:
-    _v2: true
     enabled: false
+    _v2: true
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: false
@@ -153,7 +153,7 @@ policy:
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
-    activation_checkpointing: true
+    activation_checkpointing: false
 
     tensor_model_parallel_size: 8
     expert_tensor_parallel_size: 1
@@ -199,8 +199,8 @@ policy:
 
     optimizer:
       optimizer: "adam"
-      lr: 1.0e-6
-      min_lr: 1.0e-6
+      lr: 2.0e-6
+      min_lr: 2.0e-6
       weight_decay: 0.0
       bf16: true
       fp16: false
@@ -227,7 +227,7 @@ policy:
       lr_decay_style: "constant"
       lr_decay_iters: null
       lr_warmup_iters: 0
-      lr_warmup_init: 3e-7
+      lr_warmup_init: 5e-7
 
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
@@ -267,7 +267,7 @@ policy:
     sequence_length_round: 64
 
   sequence_packing:
-    enabled: true
+    enabled: false
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: "modified_first_fit_decreasing"
@@ -311,8 +311,8 @@ policy:
       http_server_serving_chat_kwargs:
         enable_auto_tools: true
         tool_parser: qwen3_coder
-        reasoning_parser: nano_v3
-        reasoning_parser_plugin: nemo_rl/utils/nano_v3_reasoning_parser.py
+        reasoning_parser: qwen3
+        reasoning_parser_plugin: null
 
     vllm_kwargs:
       attention_backend: FLASH_ATTN
@@ -332,7 +332,7 @@ policy:
     colocated:
       enabled: false
       resources:
-        gpus_per_node: 4
+        gpus_per_node: ${cluster.gpus_per_node}
         num_nodes: 26   # Overridden by launch script
 
 # =============================================================================
@@ -407,6 +407,6 @@ logger:
 # =============================================================================
 effort_levels:
   low_string: "{reasoning effort: low}"
-  low_weight: 0.2
+  low_weight: 0.0
   low_penalty: 1
   low_ub: 3000
