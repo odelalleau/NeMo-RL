@@ -53,7 +53,7 @@ grpo:
   advantage_clip_high: 50
   val_period: -1
   val_at_start: false
-  val_at_end: false
+  val_at_end: true
   overlong_filtering: false
   max_val_samples: null
   val_batch_size: 256
@@ -192,10 +192,10 @@ policy:
     scale_loss_by_dp_cp_size: false
 
     # MTP — disabled
-    mtp_loss_scaling_factor: 0.1
-    mtp_use_repeated_layer: true
-    mtp_num_layers: 5
-    mtp_detach_heads: true
+    mtp_loss_scaling_factor: null
+    mtp_use_repeated_layer: false
+    mtp_num_layers: null
+    mtp_detach_heads: false
 
     optimizer:
       optimizer: "adam"
